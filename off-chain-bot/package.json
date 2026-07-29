@@ -1,0 +1,13 @@
+{
+  "name": "dex-arbitrage-off-chain-bot",
+  "version": "0.1.0",
+  "description": "Skeleton off-chain caller for DexArbitrageBotFlashLoan -- see index.js for what's real vs. placeholder.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0",
+    "dotenv": "^16.4.0"
+  }
+}

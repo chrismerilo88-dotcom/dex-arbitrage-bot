@@ -1,0 +1,18 @@
+[profile.default]
+src = "contracts"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc_version = "0.8.19"
+optimizer = true
+optimizer_runs = 200
+# Required: DexArbitrageBotFlashLoan.executeOperation() has enough local
+# variables that the default code generator runs out of stack slots
+# ("stack too deep"). via_ir switches to Solidity's newer IR-based
+# pipeline, which handles this correctly at the cost of slower compiles.
+via_ir = true
+
+# Fork tests need an RPC. Set MAINNET_RPC_URL in your shell or a .env file
+# (forge automatically loads .env if present) before running:
+#   forge test --fork-url $MAINNET_RPC_URL -vvv
