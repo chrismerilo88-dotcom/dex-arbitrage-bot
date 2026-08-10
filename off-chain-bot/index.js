@@ -30,6 +30,14 @@ const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 const bot = new ethers.Contract(process.env.EXECUTOR_ADDRESS, EXECUTOR_ABI, wallet);
 
+// Separate provider/wallet/contract for the actual submission, so it can
+// point at a private relay instead of the public mempool -- see
+// SUBMIT_RPC_URL in .env.example. Falls back to RPC_URL when unset, so
+// testnets work unchanged with no extra config.
+const submitProvider = new ethers.JsonRpcProvider(process.env.SUBMIT_RPC_URL || process.env.RPC_URL);
+const submitWallet = new ethers.Wallet(process.env.PRIVATE_KEY, submitProvider);
+const botSubmit = new ethers.Contract(process.env.EXECUTOR_ADDRESS, EXECUTOR_ABI, submitWallet);
+
 // abi.encode(address[] tokens, bytes extra) -- mirrors RouteData.sol.
 // extra is empty for a plain V2 leg; see the main README for V3/Curve/
 // Balancer's extra encodings.
@@ -76,15 +84,10 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
   const deadlineSeconds = 300;
 
   // --- Submission -----------------------------------------------------
-  // Sending this via provider.sendTransaction (i.e. the public mempool)
-  // is what makes this vulnerable to front-running -- see the MEV
-  // discussion earlier in this project's history. For real use, submit
-  // through a private relay instead (e.g. Flashbots Protect's RPC
-  // endpoint, or MEV Blocker) so the transaction never sits in the
-  // public mempool for a searcher to see and copy. Swapping that in is
-  // a change to how `wallet`/`provider` is constructed above, not to
-  // the call below.
-  const tx = await bot.requestFlashLoanArbitrage(
+  // Goes through botSubmit (SUBMIT_RPC_URL), not bot (RPC_URL), so this
+  // can be pointed at a private relay instead of the public mempool --
+  // see SUBMIT_RPC_URL in .env.example for the network-specific setup.
+  const tx = await botSubmit.requestFlashLoanArbitrage(
     amount,
     adapter1,
     routeData1,
