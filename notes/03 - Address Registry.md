@@ -64,10 +64,31 @@ All four Base Sepolia addresses now confirmed.
 
 | Contract | Address | Notes |
 |---|---|---|
-| `DexArbitrageBotFlashLoan` (executor) | `0x0B94075406C2c004A0f80cD016E13B7211FfCE28` | v13, live. Deployed via raw `cast send --create`, not `forge script` -- see the Foundry/revm caveat below |
+| `DexArbitrageBotFlashLoan` (executor) | `0x0B94075406C2c004A0f80cD016E13B7211FfCE28` | v13, live. Deployed via raw `cast send --create`, not `forge script` -- see the Foundry/revm caveat below. **Owner is now the Safe multisig below, not the original deployer key** |
 | `UniswapV3Adapter` | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | Wired to the confirmed SwapRouter02 + QuoterV2 above |
 
 Both `approveAdapter(UniswapV3Adapter, true)` and `approveToken(WETH, true)` were called immediately after deployment -- neither is usable until the 24h `approvalDelay` cooldown elapses. `maxLoanAmount` was deliberately left at 0 (not called), per [[04 - Deployment Runbook]] and [[06 - Pre-Mainnet Checklist]].
+
+## ✅ Base Sepolia — Safe multisig infrastructure
+
+| Contract | Address | Verified via |
+|---|---|---|
+| SafeProxyFactory (v1.4.1) | `0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67` | Official `safe-deployments` repo + `cast code` (~3KB bytecode) |
+| Safe singleton (v1.4.1) | `0x41675C099F32341bf84BFc5382aF534df5C7461a` | Official `safe-deployments` repo + `cast code` (~23.5KB) + `VERSION()` returns `"1.4.1"` |
+| CompatibilityFallbackHandler (v1.4.1) | `0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99` | Official `safe-deployments` repo + `cast code` (~5.6KB bytecode) |
+
+### Deployed Safe instance (Base Sepolia)
+
+| Item | Value |
+|---|---|
+| Safe address | `0x63d055a8D26937A98edA61bB0A4d8C8244DE3197` |
+| Owners | `0xe9376a141009cF5e6C7CE357Cf595Cf3B6a7a7Aa` (original deployer key), `0xb94976F7b0829874Fb29FC857623c8053c74736F`, `0x188A68CB73237f5650F081B7b1A021e6f9150E3a` |
+| Threshold | 2-of-3 |
+| Deployed via | `SafeProxyFactory.createProxyWithNonce()`; verified post-deploy via `getOwners()`, `getThreshold()`, and `VERSION()` all matching expectations |
+
+`DexArbitrageBotFlashLoan` (`0x0B94...FfCE28`) ownership was transferred to this Safe via the contract's existing two-step `transferOwnership()`/`acceptOwnership()` flow -- the latter executed as a properly signed 2-of-3 `execTransaction()` (built and signed entirely via `cast`, not the Safe web UI), not a single-key call. `owner()` and `pendingOwner()` were re-checked on-chain after each step to confirm state, not assumed from transaction success alone. See [[06 - Pre-Mainnet Checklist]] for why single-key ownership was the risk this addresses.
+
+**Every admin call on the bot now requires the same 2-of-3 signed pattern** -- `approveAdapter`, `approveToken`, `setMaxLoanAmount`, etc. can no longer be called with a single `cast send --private-key`.
 
 **Foundry/revm caveat, logged so it's not re-discovered from scratch**: `forge script`/`forge test --fork-url` against Base Sepolia fail with `EvmError: NotActivated` on any call into the Aave PoolAddressesProvider (`0xE4C2...4Ad00`) -- specifically its `getPool()` call reverts locally in revm at ~65 gas, while the identical call succeeds via a direct `cast call` against the real RPC (confirmed repeatedly). This affects `forge test`, `forge script` (simulated), and even `forge script --skip-simulation` (which still executes the script once locally to build the transaction list, so it hits the same wall). Tried `--evm-version` across shanghai/cancun/prague/london/paris -- no difference. Root cause is presumed to be forge 1.7.1's revm lagging some very recent Base/OP-stack chain upgrade; not yet fixed via `foundryup` (deliberately deferred, not required to unblock deployment). **Workaround used for this deployment**: bypass `forge script` entirely -- get creation bytecode via `forge inspect <Contract> bytecode`, append `cast abi-encode "constructor(...)" ...` for constructor args, and broadcast with `cast send --create`, which does no local simulation at all. See [[04 - Deployment Runbook]] for the exact commands if this needs to be repeated.
 
