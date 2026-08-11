@@ -7,6 +7,7 @@ import "forge-std/Test.sol";
 import "../contracts/DexArbitrageBotFlashLoan.sol";
 import "../contracts/adapters/UniswapV3Adapter.sol";
 import "../contracts/libraries/RouteData.sol";
+import "./helpers/RouteTestHelpers.sol";
 
 /// @notice Run against a Base Sepolia fork so every call below hits real
 /// Aave and Uniswap V3 contracts, not mocks:
@@ -64,8 +65,8 @@ contract BaseSepoliaSmokeTest is Test {
 
         assertFalse(bot.isAdapterApproved(address(v3Adapter)), "should not be usable before the cooldown");
 
-        bytes memory routeData1 = RouteData.encode(_pair(WETH, DUMMY_TOKEN), abi.encode(_fees()));
-        bytes memory routeData2 = RouteData.encode(_pair(DUMMY_TOKEN, WETH), abi.encode(_fees()));
+        bytes memory routeData1 = RouteData.encode(RouteTestHelpers.pair(WETH, DUMMY_TOKEN), abi.encode(_fees()));
+        bytes memory routeData2 = RouteData.encode(RouteTestHelpers.pair(DUMMY_TOKEN, WETH), abi.encode(_fees()));
 
         vm.expectRevert(abi.encodeWithSelector(AdapterNotApproved.selector));
         bot.requestFlashLoanArbitrage(
@@ -75,12 +76,6 @@ contract BaseSepoliaSmokeTest is Test {
         // Warp past the default 24h cooldown and confirm it flips to usable.
         vm.warp(block.timestamp + 24 hours + 1);
         assertTrue(bot.isAdapterApproved(address(v3Adapter)), "should be usable after the cooldown");
-    }
-
-    function _pair(address a, address b) internal pure returns (address[] memory path) {
-        path = new address[](2);
-        path[0] = a;
-        path[1] = b;
     }
 
     function _fees() internal pure returns (uint24[] memory fees) {

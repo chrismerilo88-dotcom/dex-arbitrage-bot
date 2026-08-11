@@ -7,6 +7,7 @@ import "forge-std/Test.sol";
 import "../contracts/DexArbitrageBotFlashLoan.sol";
 import "../contracts/adapters/UniswapV2Adapter.sol";
 import "../contracts/libraries/RouteData.sol";
+import "./helpers/RouteTestHelpers.sol";
 
 /// @notice Run against a mainnet fork so every call below hits real Aave
 /// and Uniswap contracts, not mocks:
@@ -50,8 +51,8 @@ contract DeploySmokeTest is Test {
 
         assertFalse(bot.isAdapterApproved(address(v2Adapter)), "should not be usable before the cooldown");
 
-        bytes memory routeData1 = RouteData.encode(_pair(WETH, USDC), "");
-        bytes memory routeData2 = RouteData.encode(_pair(USDC, WETH), "");
+        bytes memory routeData1 = RouteData.encode(RouteTestHelpers.pair(WETH, USDC), "");
+        bytes memory routeData2 = RouteData.encode(RouteTestHelpers.pair(USDC, WETH), "");
 
         vm.expectRevert(abi.encodeWithSelector(AdapterNotApproved.selector));
         bot.requestFlashLoanArbitrage(1 ether, address(v2Adapter), routeData1, address(v2Adapter), routeData2, 0, 300, 300, block.timestamp + 1 hours);
@@ -66,7 +67,7 @@ contract DeploySmokeTest is Test {
     }
 
     function test_V2AdapterQuoteMatchesRouterDirectly() public view {
-        address[] memory path = _pair(WETH, USDC);
+        address[] memory path = RouteTestHelpers.pair(WETH, USDC);
         bytes memory routeData = RouteData.encode(path, "");
 
         uint256 viaAdapter = v2Adapter.quote(routeData, 1 ether);
@@ -78,11 +79,5 @@ contract DeploySmokeTest is Test {
         uint256[] memory amounts = abi.decode(ret, (uint256[]));
 
         assertEq(viaAdapter, amounts[amounts.length - 1], "adapter quote should match the router's own quote exactly");
-    }
-
-    function _pair(address a, address b) internal pure returns (address[] memory path) {
-        path = new address[](2);
-        path[0] = a;
-        path[1] = b;
     }
 }
