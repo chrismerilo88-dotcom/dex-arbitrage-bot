@@ -48,6 +48,10 @@ const botSubmit = new ethers.Contract(process.env.EXECUTOR_ADDRESS, EXECUTOR_ABI
 // and Base need different private-submission setups.
 const MAINNET_CHAIN_IDS = new Set([1n, 8453n]); // Ethereum, Base
 
+// How long to wait for a submitted tx to confirm before treating it as
+// stuck and freeing its nonce -- see tryRoute()'s catch block below.
+const CONFIRMATION_TIMEOUT_MS = Number(process.env.CONFIRMATION_TIMEOUT_MS || 120_000);
+
 /// Fails loudly instead of silently degrading MEV protection: catches a
 /// misconfigured/unset SUBMIT_RPC_URL on mainnet (which would otherwise
 /// fall back to the public mempool with no warning), and catches
@@ -114,7 +118,13 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
 
   console.log(`quoted net profit: ${ethers.formatEther(netProfit)} (borrowed-asset units)`);
 
-  const executeBefore = Math.floor(Date.now() / 1000) + 120; // 2 min to land
+  // Derived from chain time, not the host's local clock (Date.now()) --
+  // block.timestamp is what executeBefore is actually compared against
+  // on-chain, and a skewed/drifting host clock (common on VMs without
+  // NTP) would otherwise cause either instant RequestExpired reverts or
+  // a much wider staleness window than intended.
+  const { timestamp: chainTimestamp } = await submitProvider.getBlock('latest');
+  const executeBefore = chainTimestamp + 120; // 2 min to land
   const deadlineSeconds = 300;
 
   // Gas-adjusted threshold: minProfit alone doesn't account for what this
@@ -164,8 +174,40 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
     executeBefore
   );
   console.log('submitted:', tx.hash);
-  const receipt = await tx.wait();
-  console.log('confirmed in block', receipt.blockNumber);
+  try {
+    const receipt = await tx.wait(1, CONFIRMATION_TIMEOUT_MS);
+    console.log('confirmed in block', receipt.blockNumber);
+  } catch (err) {
+    // Without a timeout, a bundle that never lands on a private relay
+    // leaves this process blocked indefinitely with a consumed nonce,
+    // stalling every subsequent submission behind it. On timeout, free
+    // the nonce with a 0-value self-transfer at a bumped fee, so the
+    // next scan pass isn't stuck behind a tx that may never confirm.
+    if (err.code === 'TIMEOUT') {
+      console.error(`tx ${tx.hash} did not confirm within ${CONFIRMATION_TIMEOUT_MS}ms, cancelling nonce ${tx.nonce}`);
+      await cancelStuckTransaction(tx.nonce);
+    } else {
+      throw err;
+    }
+  }
+}
+
+/** Frees a stuck nonce with a 0-value self-transfer at a bumped fee. */
+async function cancelStuckTransaction(nonce) {
+  const feeData = await submitProvider.getFeeData();
+  const cancelTx = await submitWallet.sendTransaction({
+    to: submitWallet.address,
+    value: 0,
+    nonce,
+    // A replacement tx needs a real fee bump to be accepted, not just a
+    // higher number than the original -- 50% covers typical minimum-bump
+    // requirements across clients/relays.
+    maxFeePerGas: (feeData.maxFeePerGas * 150n) / 100n,
+    maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas * 150n) / 100n,
+  });
+  console.log('cancellation tx sent:', cancelTx.hash);
+  await cancelTx.wait();
+  console.log(`nonce ${nonce} freed`);
 }
 
 // ---------------------------------------------------------------------

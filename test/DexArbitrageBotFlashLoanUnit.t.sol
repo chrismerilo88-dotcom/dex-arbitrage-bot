@@ -288,12 +288,99 @@ contract DexArbitrageBotFlashLoanUnitTest is Test {
         );
     }
 
-    function test_Request_RevertsForNonOwner() public {
+    function test_Request_RevertsForNonOperatorNonOwner() public {
         bot.setMaxLoanAmount(10 ether);
         vm.prank(nonOwner);
-        vm.expectRevert(NotOwner.selector);
+        vm.expectRevert(NotOperator.selector);
         bot.requestFlashLoanArbitrage(
             1 ether, address(adapter1), "", address(adapter2), "", 0, 300, 300, _validExecuteBefore()
         );
+    }
+
+    // =================================================================
+    // (6) Operator role
+    // =================================================================
+
+    function test_SetOperator_RevertsForNonOwner() public {
+        vm.prank(nonOwner);
+        vm.expectRevert(NotOwner.selector);
+        bot.setOperator(nonOwner);
+    }
+
+    function test_Owner_CanCallRequest_WithNoOperatorSet() public {
+        bot.setMaxLoanAmount(10 ether);
+        // Owner passes the onlyOperator gate regardless of whether an
+        // operator is set -- next revert is AdapterNotApproved (adapters
+        // were never approved in this test), proving the gate was cleared.
+        vm.expectRevert(AdapterNotApproved.selector);
+        bot.requestFlashLoanArbitrage(
+            1 ether, address(adapter1), "", address(adapter2), "", 0, 300, 300, _validExecuteBefore()
+        );
+    }
+
+    function test_Operator_CanCallRequest() public {
+        address opKey = address(0xBEEF01);
+        bot.setOperator(opKey);
+        bot.setMaxLoanAmount(10 ether);
+
+        vm.prank(opKey);
+        // Same proof pattern: clears onlyOperator, next revert is
+        // AdapterNotApproved, not NotOperator.
+        vm.expectRevert(AdapterNotApproved.selector);
+        bot.requestFlashLoanArbitrage(
+            1 ether, address(adapter1), "", address(adapter2), "", 0, 300, 300, _validExecuteBefore()
+        );
+    }
+
+    function test_Request_RevertsForOldOperator_AfterReassignment() public {
+        address opKey1 = address(0xBEEF01);
+        address opKey2 = address(0xBEEF02);
+        bot.setOperator(opKey1);
+        bot.setOperator(opKey2);
+        bot.setMaxLoanAmount(10 ether);
+
+        vm.prank(opKey1);
+        vm.expectRevert(NotOperator.selector);
+        bot.requestFlashLoanArbitrage(
+            1 ether, address(adapter1), "", address(adapter2), "", 0, 300, 300, _validExecuteBefore()
+        );
+    }
+
+    // =================================================================
+    // (7) Degenerate route rejection
+    // =================================================================
+
+    function test_Request_RevertsOnDegenerateRouteShape() public {
+        bot.approveAdapter(address(adapter1), true);
+        bot.approveAdapter(address(adapter2), true);
+        vm.warp(block.timestamp + 24 hours);
+        bot.setMaxLoanAmount(10 ether);
+
+        address[] memory sameTokenTwice = new address[](2);
+        sameTokenTwice[0] = WETH;
+        sameTokenTwice[1] = WETH;
+        bytes memory degenerateRoute = RouteData.encode(sameTokenTwice, "");
+
+        vm.expectRevert(InvalidRoute.selector);
+        bot.requestFlashLoanArbitrage(
+            1 ether,
+            address(adapter1),
+            degenerateRoute,
+            address(adapter2),
+            degenerateRoute,
+            0,
+            300,
+            300,
+            _validExecuteBefore()
+        );
+    }
+
+    // =================================================================
+    // (8) quoteRoute() restricted to approved adapters
+    // =================================================================
+
+    function test_QuoteRoute_RevertsWhenAdaptersNotApproved() public {
+        vm.expectRevert(AdapterNotApproved.selector);
+        bot.quoteRoute(1 ether, address(adapter1), "", address(adapter2), "");
     }
 }

@@ -206,6 +206,7 @@ error ProfitBelowMinimum();
 error ProfitBelowGasCost();
 error ETHWithdrawFailed();
 error NotPendingOwner();
+error NotOperator();
 
 contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
     using SafeERC20 for address;
@@ -215,6 +216,17 @@ contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
     address public pendingOwner;
     IPool public immutable POOL;
     address public immutable WETH;
+
+    /// @notice A separate, lower-privilege role that can submit requests
+    /// (requestFlashLoanArbitrage) without holding any admin capability --
+    /// approving adapters/tokens, withdrawing funds, changing owner, etc.
+    /// stay onlyOwner. Lets the always-on off-chain bot hold a hot key
+    /// that can only ever trigger trades, even after owner is migrated to
+    /// a multisig/cold setup that can't sign every request in real time.
+    /// Unset (address(0)) by default; owner can still call
+    /// requestFlashLoanArbitrage directly regardless of whether an
+    /// operator is set. See setOperator() below.
+    address public operator;
 
     /// @notice Matches the version this file's header changelog is on --
     /// see CHANGELOG.md for the full history. Bump this alongside any
@@ -286,9 +298,17 @@ contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
     event ApprovalRevoked(address indexed token, address indexed adapter);
     event PoolSet(address pool);
     event MaxLoanAmountSet(uint256 newCap);
+    event OperatorSet(address indexed operator);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    /// @notice Owner always passes this too -- operator is an additional
+    /// allowed caller for requestFlashLoanArbitrage, not a replacement.
+    modifier onlyOperator() {
+        if (msg.sender != operator && msg.sender != owner) revert NotOperator();
         _;
     }
 
@@ -339,14 +359,22 @@ contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
     /// route, so a passing quote here should mean a passing execution,
     /// modulo price movement between the quote and the actual tx landing.
     /// @dev Not `view` -- see IDexAdapter.quote()'s doc comment for why.
-    /// Call this via eth_call off-chain for a free read.
+    /// Call this via eth_call off-chain for a free read (nonReentrant
+    /// doesn't affect that -- it's a real transaction guard, not a
+    /// mutability restriction). Restricted to already-approved adapters:
+    /// unrestricted, this let any caller force the executor to make
+    /// arbitrary external calls (as msg.sender == executor) to an
+    /// address of their choosing -- not fund-losing on its own today,
+    /// but free ammunition against any future integration that trusts a
+    /// call coming from this contract's address.
     function quoteRoute(
         uint256 amount,
         address adapter1,
         bytes calldata routeData1,
         address adapter2,
         bytes calldata routeData2
-    ) external returns (uint256 netProfit) {
+    ) external nonReentrant whenNotPaused returns (uint256 netProfit) {
+        if (!isAdapterApproved(adapter1) || !isAdapterApproved(adapter2)) revert AdapterNotApproved();
         uint256 expectedMid = IDexAdapter(adapter1).quote(routeData1, amount);
         uint256 expectedFinal = IDexAdapter(adapter2).quote(routeData2, expectedMid);
 
@@ -373,6 +401,11 @@ contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
         if (tokens1.length < 2 || tokens2.length < 2) revert InvalidRoute();
         if (tokens1[tokens1.length - 1] != tokens2[0]) revert InvalidRoute();
         if (tokens2[tokens2.length - 1] != tokens1[0]) revert InvalidRoute();
+        // Degenerate leg-1 shape (e.g. [WETH, X, WETH]) would make
+        // _executeRoute's midToken == tokenIn, so the balance-delta
+        // subtraction there underflows into an opaque panic instead of a
+        // named revert -- reject it here with a clear error instead.
+        if (tokens1[0] == tokens1[tokens1.length - 1]) revert InvalidRoute();
 
         for (uint256 i = 0; i < tokens1.length; i++) {
             if (!isTokenApproved(tokens1[i])) revert TokenNotApproved(tokens1[i]);
@@ -394,6 +427,16 @@ contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
     /// @param routeData2 Leg 2 route. Must start where routeData1 ends and end back at the borrowed asset.
     /// @param minProfit Minimum net profit (after Aave's premium) required, in borrowed-asset units.
     /// @param slippageBps Max slippage tolerance per leg, in basis points (capped at 1000 = 10%).
+    /// NOT a real MEV/sandwich guard: the bound it produces is computed from a
+    /// quote taken in this same transaction (see _executeRoute), so it reads
+    /// post-frontrun state just like the swap it's meant to protect --
+    /// against a sandwich, both numbers move together and the bound can
+    /// essentially never trip. Its actual job is bounding ordinary same-block
+    /// quote-to-swap drift (nothing else can touch these pools mid-transaction,
+    /// see _executeRoute's doc comment), not adversarial price manipulation.
+    /// minProfit is what actually protects principal against a bad fill,
+    /// including a sandwiched one -- it's checked against realized balances
+    /// after both legs, independent of what slippageBps allowed through.
     /// @param deadlineSeconds Router-call deadline window, applied from block.timestamp at execution.
     /// @param executeBefore Unix timestamp; the request reverts immediately if the transaction
     /// lands after this, instead of executing later against stale conditions you never approved.
@@ -407,7 +450,7 @@ contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
         uint256 slippageBps,
         uint256 deadlineSeconds,
         uint256 executeBefore
-    ) external onlyOwner nonReentrant whenNotPaused {
+    ) external onlyOperator nonReentrant whenNotPaused {
         if (block.timestamp > executeBefore) revert RequestExpired();
         if (amount == 0) revert ZeroAmount();
         if (amount > maxLoanAmount) revert AmountExceedsCap();
@@ -661,6 +704,15 @@ contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
     function setMaxLoanAmount(uint256 newCap) external onlyOwner {
         maxLoanAmount = newCap;
         emit MaxLoanAmountSet(newCap);
+    }
+
+    /// @notice Set (or clear, via address(0)) the operator allowed to call
+    /// requestFlashLoanArbitrage without holding owner's admin privileges.
+    /// Deliberately does not require the new operator to be a contract or
+    /// pass any other check -- it's meant to be a plain hot-wallet EOA.
+    function setOperator(address newOperator) external onlyOwner {
+        operator = newOperator;
+        emit OperatorSet(newOperator);
     }
 
     function setPaused(bool _paused) external onlyOwner {

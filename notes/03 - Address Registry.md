@@ -64,10 +64,13 @@ All four Base Sepolia addresses now confirmed.
 
 | Contract | Address | Notes |
 |---|---|---|
-| `DexArbitrageBotFlashLoan` (executor) | `0x0B94075406C2c004A0f80cD016E13B7211FfCE28` | v13, live. Deployed via raw `cast send --create`, not `forge script` -- see the Foundry/revm caveat below. **Owner is now the Safe multisig below, not the original deployer key** |
-| `UniswapV3Adapter` | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | Wired to the confirmed SwapRouter02 + QuoterV2 above |
+| `DexArbitrageBotFlashLoan` (executor, **current**) | `0x9515a6e0E5e78A9C1A5cCC196800CA176FCBD486` | v13 source (post-operator-role), live. Owner is the Safe multisig below; `operator` is the bot's hot key `0xe9376a141009cF5e6C7CE357Cf595Cf3B6a7a7Aa` -- restores the bot's ability to call `requestFlashLoanArbitrage` after ownership moved to the Safe, which a single-key bot can no longer do directly (confirmed live: `estimateGas` from the bot key reverts with `AmountExceedsCap`, not `NotOperator`) |
+| `DexArbitrageBotFlashLoan` (executor, **deprecated**) | `0x0B94075406C2c004A0f80cD016E13B7211FfCE28` | **Do not use** -- source predates the `operator` role; once ownership moved to the Safe, the bot's hot key could no longer call `requestFlashLoanArbitrage` at all (`onlyOwner`, not `onlyOperator`). Superseded by the address above. |
+| `UniswapV3Adapter` | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | Unchanged, reused across both executor deployments -- wired to the confirmed SwapRouter02 + QuoterV2 above |
 
-Both `approveAdapter(UniswapV3Adapter, true)` and `approveToken(WETH, true)` were called immediately after deployment -- neither is usable until the 24h `approvalDelay` cooldown elapses. `maxLoanAmount` was deliberately left at 0 (not called), per [[04 - Deployment Runbook]] and [[06 - Pre-Mainnet Checklist]].
+Both `approveAdapter`/`approveToken` are active on the current executor (`approvalDelay` was temporarily set to 0 for this redeploy -- a testnet-only convenience per [[04 - Deployment Runbook]] -- then left at 0 rather than restored to 24h, since restoring it retroactively re-locks already-approved items against their original approval timestamp; caught live when `isAdapterApproved`/`isTokenApproved` unexpectedly flipped back to `false` right after the restore). `maxLoanAmount` remains deliberately 0 (not called), per [[04 - Deployment Runbook]] and [[06 - Pre-Mainnet Checklist]].
+
+**Note for next deployment**: `VERSION()` still returns `"v13"` despite the operator-role/quoteRoute/degenerate-route changes -- the header changelog and `VERSION` constant weren't bumped before this redeploy. Worth doing before the *next* one, per the contract's own stated convention ("bump this alongside any future header changelog entry so it's checkable on-chain").
 
 ## ✅ Base Sepolia — Safe multisig infrastructure
 

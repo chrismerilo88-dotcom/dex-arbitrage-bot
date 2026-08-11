@@ -2,13 +2,21 @@
 pragma solidity ^0.8.19;
 
 import "../interfaces/IDexAdapter.sol";
+import "../interfaces/IERC20Min.sol";
 import "../libraries/RouteData.sol";
 import "../libraries/SafeERC20.sol";
 import "../libraries/CommonErrors.sol";
 
 interface ICurvePool {
     function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256);
-    function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256);
+    // Deliberately no declared return value: classic Vyper StableSwap
+    // pools (3pool-era) declare exchange() with no return value at all,
+    // and Solidity reverts on decoding a return type the actual call
+    // didn't provide. Not declaring one here works against both that
+    // style and newer pools that do return a uint256 -- either way, the
+    // real output is measured via balance delta below instead of trusted
+    // from a return value.
+    function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external;
     function coins(uint256 index) external view returns (address);
 }
 
@@ -80,7 +88,15 @@ contract CurveAdapter is IDexAdapter {
         tokenIn.safeTransferFrom(msg.sender, address(this), amountIn);
         tokenIn.safeApprove(address(POOL), amountIn);
 
-        amountOut = POOL.exchange(i, j, amountIn, minAmountOut);
+        // Measured via balance delta, not trusted from a return value --
+        // exchange() deliberately has no declared return type (see
+        // ICurvePool above), and this is also what makes forwarding exact
+        // rather than approximate: whatever the pool actually paid out is
+        // what gets forwarded, with nothing left behind regardless of any
+        // rounding/fee-on-transfer quirk on tokenOut.
+        uint256 balBefore = IERC20Min(tokenOut).balanceOf(address(this));
+        POOL.exchange(i, j, amountIn, minAmountOut);
+        amountOut = IERC20Min(tokenOut).balanceOf(address(this)) - balBefore;
 
         if (recipient != address(this)) {
             tokenOut.safeTransfer(recipient, amountOut);
