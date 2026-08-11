@@ -1,18 +1,19 @@
 /**
  * The off-chain half of this system.
  *
- * Two parts: (1) opportunity discovery -- scans BORROWED_ASSET -> via ->
- * BORROWED_ASSET round trips across configured V3 fee-tier combinations
- * through the one adapter this project currently has approved per
- * network (see the "Opportunity discovery" section below), and (2)
+ * Two parts: (1) opportunity discovery -- scans 2-hop and triangular
+ * (3-hop) BORROWED_ASSET round trips across every configured adapter
+ * pair and V3 fee-tier combination (see the "Opportunity discovery"
+ * section below for the three axes of coverage: adapters, triangular
+ * routes, and WATCH_MODE for block-reactive scanning), and (2)
  * tryRoute() -- verifies profitability against live chain state via
  * quoteRoute() before spending any gas, then submits the request.
  *
- * This is a real, working scanner, but not a production one -- it scans
- * a fixed candidate list on a timer, not in reaction to new blocks or
- * mempool activity, and it has no local reserve math (every candidate
- * costs a network round trip). See the "Opportunity discovery" section
- * comment for what a production version needs on top of this.
+ * This is a real, working scanner, but not a production one -- it has
+ * no local reserve math, so every candidate costs a real network round
+ * trip (batched, see SCAN_CONCURRENCY), and even in WATCH_MODE it reacts
+ * to confirmed blocks, not pending mempool transactions. See the
+ * "Opportunity discovery" section comment for exactly what's covered.
  *
  * Usage:
  *   npm install
@@ -170,24 +171,45 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
 // ---------------------------------------------------------------------
 // Opportunity discovery.
 //
-// This project currently has one DEX adapter approved per network (see
-// notes/03 - Address Registry.md), not multiple DEXs to compare against
-// each other -- so the realistic candidate set right now is every
-// BORROWED_ASSET -> viaToken -> BORROWED_ASSET round trip through that
-// one adapter, across every V3 fee-tier combination for the two legs.
-// Adding a second adapter later (a different DEX, or a different V3
-// pool deployment) is a straightforward extension of buildCandidates()
-// below, not a redesign.
+// Three axes of coverage, all driven by config (see .env.example) so
+// adding a newly-deployed adapter or a newly-approved token needs no
+// code change:
 //
-// This is still not a production scanner: quoteRoute() calls are free
-// eth_call reads (no gas spent scanning), but each one is a network
-// round trip against a fixed token/fee-tier list on a timer, not a
-// reaction to new blocks or mempool activity. Speed is most of the
-// competitive edge in real MEV competition, and getting there means
-// replacing this section with block/mempool-triggered scanning and
-// (for real speed) local reserve math instead of a live call per
-// candidate -- that's the "substantial project of its own" this file's
-// header comment refers to.
+// 1. ADAPTERS (plural) -- every adapter1 x adapter2 combination gets
+//    scanned, not just "the one adapter" against itself. Today this
+//    project has one adapter approved per network (see notes/03 -
+//    Address Registry.md), so that's a 1x1 product -- identical
+//    behavior to before. The moment a second adapter (a different DEX,
+//    or a second V3 deployment) is approved, it's compared automatically.
+//
+// 2. Triangular routes -- when 2+ VIA_TOKENS are configured, every
+//    ordered pair of *distinct* via-tokens also gets scanned as a
+//    3-hop BORROWED_ASSET -> viaA -> viaB -> BORROWED_ASSET route (both
+//    ways to split a 3-hop path across the executor's two legs), in
+//    addition to the plain 2-hop BORROWED_ASSET -> via -> BORROWED_ASSET
+//    round trips. See buildTriangularCandidates() below -- this is a
+//    direct application of what the architecture already supports
+//    (RouteData's `tokens` array can be more than 2 tokens; a single
+//    adapter leg can be multiple hops), not a new on-chain capability.
+//
+// 3. Speed -- WATCH_MODE=true re-runs the scan on every new block
+//    instead of once and exiting, via the provider's own block
+//    subscription (works over plain HTTPS RPC through ethers' internal
+//    polling, or faster still over a wss:// endpoint if your RPC
+//    provider supports one -- same code path either way). True
+//    mempool-level reaction (seeing a pending tx before it lands, not
+//    just reacting to the block after) needs a provider that exposes
+//    pending-transaction subscriptions, which isn't universal across
+//    RPC providers -- that's a further step on top of this, not
+//    something this generic script can assume it has access to.
+//
+// Still not a production scanner even with all three: it has no local
+// reserve math, so every candidate costs a real network round trip
+// (batched via SCAN_CONCURRENCY to avoid hammering the RPC provider --
+// see rankCandidates() below), and candidate count grows combinatorially
+// with how many adapters/via-tokens/fee-tiers you configure. Keep that
+// list deliberately scoped to what's actually approved and worth
+// checking, not "everything you can think of."
 // ---------------------------------------------------------------------
 
 function parseAddressList(envVar) {
@@ -201,25 +223,45 @@ function parseFeeTiers() {
   return (process.env.FEE_TIERS || '500,3000,10000').split(',').map((s) => Number(s.trim()));
 }
 
+/** Cartesian product of feeTiers, `hops` deep -- one fee tier per hop in a leg. */
+function feeCombos(feeTiers, hops) {
+  if (hops <= 1) return feeTiers.map((f) => [f]);
+  const shorter = feeCombos(feeTiers, hops - 1);
+  const combos = [];
+  for (const f of feeTiers) {
+    for (const rest of shorter) combos.push([f, ...rest]);
+  }
+  return combos;
+}
+
+function adapterPairs(adapters) {
+  const pairs = [];
+  for (const a1 of adapters) {
+    for (const a2 of adapters) pairs.push([a1, a2]);
+  }
+  return pairs;
+}
+
 /**
- * Builds every BORROWED_ASSET -> viaToken -> BORROWED_ASSET round trip
- * across every fee-tier combination for the two legs, using the same
- * adapter for both -- see the section comment above for why.
+ * Every BORROWED_ASSET -> viaToken -> BORROWED_ASSET round trip (one hop
+ * per leg), across every adapter pair and fee-tier combination.
  */
-function buildCandidates({ adapter, borrowedAsset, viaTokens, feeTiers, amount, minProfit, slippageBps }) {
+function buildTwoLegCandidates({ adapters, borrowedAsset, viaTokens, feeTiers, amount, minProfit, slippageBps }) {
   const candidates = [];
-  for (const viaToken of viaTokens) {
-    for (const feeOut of feeTiers) {
-      for (const feeBack of feeTiers) {
-        candidates.push({
-          amount,
-          adapter1: adapter,
-          routeData1: encodeV3RouteData([borrowedAsset, viaToken], [feeOut]),
-          adapter2: adapter,
-          routeData2: encodeV3RouteData([viaToken, borrowedAsset], [feeBack]),
-          minProfit,
-          slippageBps,
-        });
+  for (const [adapter1, adapter2] of adapterPairs(adapters)) {
+    for (const viaToken of viaTokens) {
+      for (const [feeOut] of feeCombos(feeTiers, 1)) {
+        for (const [feeBack] of feeCombos(feeTiers, 1)) {
+          candidates.push({
+            amount,
+            adapter1,
+            routeData1: encodeV3RouteData([borrowedAsset, viaToken], [feeOut]),
+            adapter2,
+            routeData2: encodeV3RouteData([viaToken, borrowedAsset], [feeBack]),
+            minProfit,
+            slippageBps,
+          });
+        }
       }
     }
   }
@@ -227,51 +269,119 @@ function buildCandidates({ adapter, borrowedAsset, viaTokens, feeTiers, amount, 
 }
 
 /**
- * Quotes every candidate via quoteRoute() -- a free eth_call, not a real
- * transaction -- and returns the ones that didn't revert, best-profit
- * first. A candidate reverting just means no pool exists at that
- * specific fee-tier combination, or the route isn't currently viable;
- * that's an expected, common outcome when scanning fee-tier
- * combinations, not a fatal error for the scan as a whole.
+ * Every BORROWED_ASSET -> viaA -> viaB -> BORROWED_ASSET triangular
+ * route, for every ordered pair of *distinct* via-tokens, across every
+ * adapter pair and fee-tier combination. Built both ways to split the
+ * 3-hop path across the executor's two legs (1-hop-then-2-hop, and
+ * 2-hop-then-1-hop) since both are valid and may quote differently.
  */
-async function rankCandidates(candidates) {
-  const quoted = await Promise.all(
-    candidates.map(async (c) => {
-      try {
-        const netProfit = await bot.quoteRoute.staticCall(c.amount, c.adapter1, c.routeData1, c.adapter2, c.routeData2);
-        return { ...c, netProfit };
-      } catch {
-        return null;
+function buildTriangularCandidates({ adapters, borrowedAsset, viaTokens, feeTiers, amount, minProfit, slippageBps }) {
+  const candidates = [];
+  for (const [adapter1, adapter2] of adapterPairs(adapters)) {
+    for (const viaA of viaTokens) {
+      for (const viaB of viaTokens) {
+        if (viaA === viaB) continue;
+
+        // Split A: leg1 = borrowed -> viaA (1 hop), leg2 = viaA -> viaB -> borrowed (2 hops)
+        for (const [feeOut] of feeCombos(feeTiers, 1)) {
+          for (const feeBackPair of feeCombos(feeTiers, 2)) {
+            candidates.push({
+              amount,
+              adapter1,
+              routeData1: encodeV3RouteData([borrowedAsset, viaA], [feeOut]),
+              adapter2,
+              routeData2: encodeV3RouteData([viaA, viaB, borrowedAsset], feeBackPair),
+              minProfit,
+              slippageBps,
+            });
+          }
+        }
+
+        // Split B: leg1 = borrowed -> viaA -> viaB (2 hops), leg2 = viaB -> borrowed (1 hop)
+        for (const feeOutPair of feeCombos(feeTiers, 2)) {
+          for (const [feeBack] of feeCombos(feeTiers, 1)) {
+            candidates.push({
+              amount,
+              adapter1,
+              routeData1: encodeV3RouteData([borrowedAsset, viaA, viaB], feeOutPair),
+              adapter2,
+              routeData2: encodeV3RouteData([viaB, borrowedAsset], [feeBack]),
+              minProfit,
+              slippageBps,
+            });
+          }
+        }
       }
-    })
-  );
-  return quoted.filter((c) => c !== null).sort((a, b) => (b.netProfit > a.netProfit ? 1 : b.netProfit < a.netProfit ? -1 : 0));
+    }
+  }
+  return candidates;
 }
 
-async function main() {
-  await assertSubmissionSetupIsSafe();
+function buildCandidates(config) {
+  const candidates = buildTwoLegCandidates(config);
+  if (config.viaTokens.length >= 2) {
+    candidates.push(...buildTriangularCandidates(config));
+  }
+  return candidates;
+}
 
-  const adapter = process.env.ADAPTER_ADDRESS;
+/**
+ * Quotes every candidate via quoteRoute() -- a free eth_call, not a real
+ * transaction -- in batches of `concurrency` at a time (rather than all
+ * at once) so a broad scan doesn't fire hundreds of simultaneous
+ * requests at the RPC provider. Returns the candidates that didn't
+ * revert, best-profit first. A candidate reverting just means no pool
+ * exists at that specific fee-tier combination, or the route isn't
+ * currently viable; that's an expected, common outcome when scanning
+ * many fee-tier/token combinations, not a fatal error for the scan as
+ * a whole.
+ */
+async function rankCandidates(candidates, concurrency) {
+  const results = [];
+  for (let i = 0; i < candidates.length; i += concurrency) {
+    const batch = candidates.slice(i, i + concurrency);
+    const batchResults = await Promise.all(
+      batch.map(async (c) => {
+        try {
+          const netProfit = await bot.quoteRoute.staticCall(c.amount, c.adapter1, c.routeData1, c.adapter2, c.routeData2);
+          return { ...c, netProfit };
+        } catch {
+          return null;
+        }
+      })
+    );
+    results.push(...batchResults);
+  }
+  return results.filter((c) => c !== null).sort((a, b) => (b.netProfit > a.netProfit ? 1 : b.netProfit < a.netProfit ? -1 : 0));
+}
+
+function loadScanConfig() {
+  const adapters = parseAddressList('ADAPTERS');
   const borrowedAsset = process.env.BORROWED_ASSET;
   const viaTokens = parseAddressList('VIA_TOKENS');
 
-  if (!adapter || !borrowedAsset || viaTokens.length === 0) {
-    console.log('Set ADAPTER_ADDRESS, BORROWED_ASSET, and VIA_TOKENS in .env to scan for routes -- see .env.example.');
-    return;
+  if (adapters.length === 0 || !borrowedAsset || viaTokens.length === 0) {
+    return null;
   }
 
-  const candidates = buildCandidates({
-    adapter,
+  return {
+    adapters,
     borrowedAsset,
     viaTokens,
     feeTiers: parseFeeTiers(),
     amount: ethers.parseEther(process.env.SCAN_AMOUNT || '1'),
     minProfit: ethers.parseEther(process.env.MIN_PROFIT || '0.01'),
     slippageBps: Number(process.env.SLIPPAGE_BPS || 300),
-  });
+    concurrency: Number(process.env.SCAN_CONCURRENCY || 20),
+  };
+}
+
+/** One full scan-and-try pass. Called once directly, or repeatedly in WATCH_MODE. */
+async function scanOnce(config) {
+  const candidates = buildCandidates(config);
   console.log(`scanning ${candidates.length} candidate route(s)...`);
 
-  const ranked = await rankCandidates(candidates);
+  const ranked = await rankCandidates(candidates, config.concurrency);
   console.log(`${ranked.length} candidate(s) returned a quote (the rest had no pool at that fee tier, or reverted)`);
   if (ranked.length === 0) {
     console.log('no viable routes found this pass');
@@ -285,6 +395,41 @@ async function main() {
   // duplicate work: it's a fresh state check immediately before spending
   // gas, in case anything moved between this scan and now.
   await tryRoute(best);
+}
+
+async function main() {
+  await assertSubmissionSetupIsSafe();
+
+  const config = loadScanConfig();
+  if (!config) {
+    console.log('Set ADAPTERS, BORROWED_ASSET, and VIA_TOKENS in .env to scan for routes -- see .env.example.');
+    return;
+  }
+
+  if (process.env.WATCH_MODE === 'true') {
+    console.log('watch mode: scanning on every new block (Ctrl+C to stop)...');
+    let scanning = false;
+    provider.on('block', async (blockNumber) => {
+      if (scanning) {
+        console.log(`block ${blockNumber}: previous scan still running, skipping this block`);
+        return;
+      }
+      scanning = true;
+      try {
+        console.log(`--- block ${blockNumber} ---`);
+        await scanOnce(config);
+      } catch (err) {
+        console.error('scan error (continuing to watch):', err);
+      } finally {
+        scanning = false;
+      }
+    });
+    // Intentionally never resolves -- the block listener above is what
+    // keeps the process alive. Ctrl+C (or a process manager) stops it.
+    return new Promise(() => {});
+  }
+
+  await scanOnce(config);
 }
 
 main().catch((err) => {
