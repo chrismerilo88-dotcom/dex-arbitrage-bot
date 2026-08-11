@@ -9,7 +9,10 @@ import "../libraries/CommonErrors.sol";
 interface ICurvePool {
     function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256);
     function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256);
+    function coins(uint256 index) external view returns (address);
 }
+
+error CoinIndexMismatch();
 
 /// @notice Wraps a single Curve pool's exchange() behind IDexAdapter.
 ///
@@ -19,8 +22,11 @@ interface ICurvePool {
 ///
 /// routeData's `extra` field is abi.encode(int128 i, int128 j): the
 /// pool's own coin indices for tokens[0] and tokens[1] respectively.
-/// Verify these against the specific pool's coins() ordering before use
-/// -- getting i/j backwards silently swaps the wrong direction.
+/// Both quote() and swap() verify coins(i) == tokens[0] and
+/// coins(j) == tokens[1] on-chain (reverts with CoinIndexMismatch if
+/// not) -- this is what actually binds the executor's token allowlist
+/// (checked against `tokens`, not `extra`) to what the pool trades,
+/// since `tokens` doesn't otherwise determine the swap direction here.
 ///
 /// CAUTION: this interface (int128 indices, exchange/get_dy names)
 /// matches Curve's classic stable-pool style (e.g. 3pool). Newer crypto
@@ -52,6 +58,7 @@ contract CurveAdapter is IDexAdapter {
         (address[] memory tokens, bytes memory extra) = routeData.decode();
         if (tokens.length != 2) revert UnsupportedRoute();
         (int128 i, int128 j) = abi.decode(extra, (int128, int128));
+        _requireIndicesMatch(tokens, i, j);
         amountOut = POOL.get_dy(i, j, amountIn);
     }
 
@@ -65,6 +72,7 @@ contract CurveAdapter is IDexAdapter {
         (address[] memory tokens, bytes memory extra) = routeData.decode();
         if (tokens.length != 2) revert UnsupportedRoute();
         (int128 i, int128 j) = abi.decode(extra, (int128, int128));
+        _requireIndicesMatch(tokens, i, j);
 
         address tokenIn = tokens[0];
         address tokenOut = tokens[1];
@@ -77,5 +85,20 @@ contract CurveAdapter is IDexAdapter {
         if (recipient != address(this)) {
             tokenOut.safeTransfer(recipient, amountOut);
         }
+    }
+
+    /// @dev Binds the pool's own coin indices to the executor-allowlisted
+    /// `tokens` array -- without this, `tokens` plays no role in which
+    /// coins actually trade, so the executor's per-token allowlist check
+    /// (against `tokens`, not `extra`) wouldn't actually constrain
+    /// anything for Curve routes.
+    function _requireIndicesMatch(address[] memory tokens, int128 i, int128 j) internal view {
+        if (i < 0 || j < 0) revert CoinIndexMismatch();
+        // casting to 'uint128' is safe because the non-negative check above
+        // already reverted on any value this cast could otherwise misread.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (POOL.coins(uint256(uint128(i))) != tokens[0]) revert CoinIndexMismatch();
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (POOL.coins(uint256(uint128(j))) != tokens[1]) revert CoinIndexMismatch();
     }
 }

@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+out/
+cache/
+broadcast/
+node_modules/
+.claude/*.local.md

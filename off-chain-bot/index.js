@@ -38,6 +38,31 @@ const submitProvider = new ethers.JsonRpcProvider(process.env.SUBMIT_RPC_URL || 
 const submitWallet = new ethers.Wallet(process.env.PRIVATE_KEY, submitProvider);
 const botSubmit = new ethers.Contract(process.env.EXECUTOR_ADDRESS, EXECUTOR_ABI, submitWallet);
 
+// Chain IDs where "submit through the public mempool" is not an acceptable
+// default -- see SUBMIT_RPC_URL's comment in .env.example for why Ethereum
+// and Base need different private-submission setups.
+const MAINNET_CHAIN_IDS = new Set([1n, 8453n]); // Ethereum, Base
+
+/// Fails loudly instead of silently degrading MEV protection: catches a
+/// misconfigured/unset SUBMIT_RPC_URL on mainnet (which would otherwise
+/// fall back to the public mempool with no warning), and catches
+/// RPC_URL/SUBMIT_RPC_URL pointing at two different chains (which would
+/// sign a transaction against the wrong network's EXECUTOR_ADDRESS).
+async function assertSubmissionSetupIsSafe() {
+  const [readNet, submitNet] = await Promise.all([provider.getNetwork(), submitProvider.getNetwork()]);
+
+  if (readNet.chainId !== submitNet.chainId) {
+    throw new Error(
+      `chain mismatch: RPC_URL is chain ${readNet.chainId}, SUBMIT_RPC_URL is chain ${submitNet.chainId}`
+    );
+  }
+  if (MAINNET_CHAIN_IDS.has(readNet.chainId) && !process.env.SUBMIT_RPC_URL) {
+    throw new Error(
+      `SUBMIT_RPC_URL is required on chain ${readNet.chainId} -- refusing to submit through the public mempool`
+    );
+  }
+}
+
 // abi.encode(address[] tokens, bytes extra) -- mirrors RouteData.sol.
 // extra is empty for a plain V2 leg; see the main README for V3/Curve/
 // Balancer's extra encodings.
@@ -75,13 +100,40 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
   const netProfit = await bot.quoteRoute.staticCall(amount, adapter1, routeData1, adapter2, routeData2);
 
   console.log(`quoted net profit: ${ethers.formatEther(netProfit)} (borrowed-asset units)`);
-  if (netProfit < minProfit) {
-    console.log('below minProfit threshold, skipping');
-    return;
-  }
 
   const executeBefore = Math.floor(Date.now() / 1000) + 120; // 2 min to land
   const deadlineSeconds = 300;
+
+  // Gas-adjusted threshold: minProfit alone doesn't account for what this
+  // specific request will actually cost to land. Only directly comparable
+  // to netProfit when the borrowed asset is WETH (matching the on-chain
+  // gas backstop's own restriction, see item 21 in the contract's header)
+  // -- for any other borrowed asset, price gasCostWei into borrowed-asset
+  // units yourself before relying on this comparison.
+  const gasEstimate = await botSubmit.requestFlashLoanArbitrage.estimateGas(
+    amount,
+    adapter1,
+    routeData1,
+    adapter2,
+    routeData2,
+    minProfit,
+    slippageBps,
+    deadlineSeconds,
+    executeBefore
+  );
+  const feeData = await submitProvider.getFeeData();
+  // 25% headroom: the on-chain gas backstop only measures executeOperation's
+  // own gas, not the outer tx's base cost, calldata cost, or Aave's
+  // pre/post bookkeeping -- this estimate has the same blind spots.
+  const gasCostWei = (gasEstimate * feeData.maxFeePerGas * 125n) / 100n;
+  const effectiveMinProfit = minProfit + gasCostWei;
+
+  if (netProfit < effectiveMinProfit) {
+    console.log(
+      `below gas-adjusted threshold (minProfit ${ethers.formatEther(minProfit)} + est. gas ${ethers.formatEther(gasCostWei)}), skipping`
+    );
+    return;
+  }
 
   // --- Submission -----------------------------------------------------
   // Goes through botSubmit (SUBMIT_RPC_URL), not bot (RPC_URL), so this
@@ -115,6 +167,8 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
 // watch), not on a timer -- speed is most of the competitive edge here.
 // ---------------------------------------------------------------------
 async function main() {
+  await assertSubmissionSetupIsSafe();
+
   const WETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
   const USDC = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
 
