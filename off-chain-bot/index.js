@@ -1,17 +1,21 @@
 /**
- * Minimal skeleton for the off-chain half of this system.
+ * The off-chain half of this system.
  *
- * This is NOT a scanner -- it doesn't discover opportunities on its own.
- * It shows the two things every scanner eventually needs regardless of
- * how it finds a candidate route: (1) verify profitability against live
- * chain state via quoteRoute() before spending any gas, and (2) submit
- * the request. Where you plug in real opportunity discovery (comparing
- * quotes across many pools, reacting to new blocks or mempool activity)
- * is marked below -- that's the actual "bot" and it's a substantial
- * project of its own, not something with one correct implementation.
+ * Two parts: (1) opportunity discovery -- scans BORROWED_ASSET -> via ->
+ * BORROWED_ASSET round trips across configured V3 fee-tier combinations
+ * through the one adapter this project currently has approved per
+ * network (see the "Opportunity discovery" section below), and (2)
+ * tryRoute() -- verifies profitability against live chain state via
+ * quoteRoute() before spending any gas, then submits the request.
+ *
+ * This is a real, working scanner, but not a production one -- it scans
+ * a fixed candidate list on a timer, not in reaction to new blocks or
+ * mempool activity, and it has no local reserve math (every candidate
+ * costs a network round trip). See the "Opportunity discovery" section
+ * comment for what a production version needs on top of this.
  *
  * Usage:
- *   npm install ethers dotenv
+ *   npm install
  *   node index.js
  */
 
@@ -64,11 +68,19 @@ async function assertSubmissionSetupIsSafe() {
 }
 
 // abi.encode(address[] tokens, bytes extra) -- mirrors RouteData.sol.
-// extra is empty for a plain V2 leg; see the main README for V3/Curve/
+// extra is empty for a plain V2 leg; see the main README for Curve/
 // Balancer's extra encodings.
 function encodeV2RouteData(tokens) {
   const abiCoder = ethers.AbiCoder.defaultAbiCoder();
   return abiCoder.encode(['address[]', 'bytes'], [tokens, '0x']);
+}
+
+// Same RouteData envelope, but `extra` is abi.encode(uint24[] fees) --
+// one Uniswap V3 fee tier per hop, matching UniswapV3Adapter.sol exactly.
+function encodeV3RouteData(tokens, fees) {
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  const extra = abiCoder.encode(['uint24[]'], [fees]);
+  return abiCoder.encode(['address[]', 'bytes'], [tokens, extra]);
 }
 
 /**
@@ -156,33 +168,123 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
 }
 
 // ---------------------------------------------------------------------
-// >>> Real opportunity discovery goes here. <<<
-// This is where an actual bot spends most of its engineering effort:
-// pulling reserves/quotes across every pool you care about (directly via
-// each protocol's contracts, or a subgraph/indexer for speed), computing
-// candidate routes and their approximate profitability *before* paying
-// for an on-chain quoteRoute() call, and deciding which candidates are
-// worth the round-trip above. A production version of this typically
-// runs on every new block (or every pending tx that touches a pool you
-// watch), not on a timer -- speed is most of the competitive edge here.
+// Opportunity discovery.
+//
+// This project currently has one DEX adapter approved per network (see
+// notes/03 - Address Registry.md), not multiple DEXs to compare against
+// each other -- so the realistic candidate set right now is every
+// BORROWED_ASSET -> viaToken -> BORROWED_ASSET round trip through that
+// one adapter, across every V3 fee-tier combination for the two legs.
+// Adding a second adapter later (a different DEX, or a different V3
+// pool deployment) is a straightforward extension of buildCandidates()
+// below, not a redesign.
+//
+// This is still not a production scanner: quoteRoute() calls are free
+// eth_call reads (no gas spent scanning), but each one is a network
+// round trip against a fixed token/fee-tier list on a timer, not a
+// reaction to new blocks or mempool activity. Speed is most of the
+// competitive edge in real MEV competition, and getting there means
+// replacing this section with block/mempool-triggered scanning and
+// (for real speed) local reserve math instead of a live call per
+// candidate -- that's the "substantial project of its own" this file's
+// header comment refers to.
 // ---------------------------------------------------------------------
+
+function parseAddressList(envVar) {
+  return (process.env[envVar] || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseFeeTiers() {
+  return (process.env.FEE_TIERS || '500,3000,10000').split(',').map((s) => Number(s.trim()));
+}
+
+/**
+ * Builds every BORROWED_ASSET -> viaToken -> BORROWED_ASSET round trip
+ * across every fee-tier combination for the two legs, using the same
+ * adapter for both -- see the section comment above for why.
+ */
+function buildCandidates({ adapter, borrowedAsset, viaTokens, feeTiers, amount, minProfit, slippageBps }) {
+  const candidates = [];
+  for (const viaToken of viaTokens) {
+    for (const feeOut of feeTiers) {
+      for (const feeBack of feeTiers) {
+        candidates.push({
+          amount,
+          adapter1: adapter,
+          routeData1: encodeV3RouteData([borrowedAsset, viaToken], [feeOut]),
+          adapter2: adapter,
+          routeData2: encodeV3RouteData([viaToken, borrowedAsset], [feeBack]),
+          minProfit,
+          slippageBps,
+        });
+      }
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Quotes every candidate via quoteRoute() -- a free eth_call, not a real
+ * transaction -- and returns the ones that didn't revert, best-profit
+ * first. A candidate reverting just means no pool exists at that
+ * specific fee-tier combination, or the route isn't currently viable;
+ * that's an expected, common outcome when scanning fee-tier
+ * combinations, not a fatal error for the scan as a whole.
+ */
+async function rankCandidates(candidates) {
+  const quoted = await Promise.all(
+    candidates.map(async (c) => {
+      try {
+        const netProfit = await bot.quoteRoute.staticCall(c.amount, c.adapter1, c.routeData1, c.adapter2, c.routeData2);
+        return { ...c, netProfit };
+      } catch {
+        return null;
+      }
+    })
+  );
+  return quoted.filter((c) => c !== null).sort((a, b) => (b.netProfit > a.netProfit ? 1 : b.netProfit < a.netProfit ? -1 : 0));
+}
+
 async function main() {
   await assertSubmissionSetupIsSafe();
 
-  const WETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
-  const USDC = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
+  const adapter = process.env.ADAPTER_ADDRESS;
+  const borrowedAsset = process.env.BORROWED_ASSET;
+  const viaTokens = parseAddressList('VIA_TOKENS');
 
-  // Placeholder candidate -- replace with a route your own scanning logic
-  // actually found to be promising.
-  await tryRoute({
-    amount: ethers.parseEther('1'),
-    adapter1: process.env.UNISWAP_V2_ADAPTER,
-    routeData1: encodeV2RouteData([WETH, USDC]),
-    adapter2: process.env.SUSHISWAP_V2_ADAPTER,
-    routeData2: encodeV2RouteData([USDC, WETH]),
-    minProfit: ethers.parseEther('0.01'),
-    slippageBps: 300,
+  if (!adapter || !borrowedAsset || viaTokens.length === 0) {
+    console.log('Set ADAPTER_ADDRESS, BORROWED_ASSET, and VIA_TOKENS in .env to scan for routes -- see .env.example.');
+    return;
+  }
+
+  const candidates = buildCandidates({
+    adapter,
+    borrowedAsset,
+    viaTokens,
+    feeTiers: parseFeeTiers(),
+    amount: ethers.parseEther(process.env.SCAN_AMOUNT || '1'),
+    minProfit: ethers.parseEther(process.env.MIN_PROFIT || '0.01'),
+    slippageBps: Number(process.env.SLIPPAGE_BPS || 300),
   });
+  console.log(`scanning ${candidates.length} candidate route(s)...`);
+
+  const ranked = await rankCandidates(candidates);
+  console.log(`${ranked.length} candidate(s) returned a quote (the rest had no pool at that fee tier, or reverted)`);
+  if (ranked.length === 0) {
+    console.log('no viable routes found this pass');
+    return;
+  }
+
+  const best = ranked[0];
+  console.log(`best candidate net profit: ${ethers.formatEther(best.netProfit)}`);
+
+  // tryRoute() re-quotes internally before submitting -- intentional, not
+  // duplicate work: it's a fresh state check immediately before spending
+  // gas, in case anything moved between this scan and now.
+  await tryRoute(best);
 }
 
 main().catch((err) => {
