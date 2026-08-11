@@ -1,0 +1,11 @@
+{
+  "enabledPlugins": {
+    "ralph-loop@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(forge build *)",
+      "Bash(forge test *)"
+    ]
+  }
+}
