@@ -60,7 +60,6 @@ contract BaseSepoliaSmokeTest is Test {
     function test_RevertsBeforeCooldownElapses() public {
         bot.approveAdapter(address(v3Adapter), true);
         bot.approveToken(WETH, true);
-        bot.approveToken(DUMMY_TOKEN, true);
         bot.setMaxLoanAmount(10 ether);
 
         assertFalse(bot.isAdapterApproved(address(v3Adapter)), "should not be usable before the cooldown");
