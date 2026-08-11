@@ -34,7 +34,7 @@ import "../contracts/adapters/UniswapV3Adapter.sol";
 /// afterward. Check with quoteRoute() before attempting a real request.
 contract DeploySepolia is Script {
     address constant SEPOLIA_WETH = 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
-    address constant SEPOLIA_AAVE_ADDRESSES_PROVIDER = 0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e;
+    address constant SEPOLIA_AAVE_ADDRESSES_PROVIDER = 0x012bAC54348C0E635dCAc9D5FB99f06F24136C9A;
     address constant SEPOLIA_UNISWAP_V3_ROUTER02 = 0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E;
     address constant SEPOLIA_UNISWAP_V3_QUOTERV2 = 0x61fFE014bA17989E743c5F6cB21bF9697530B21e;
 
