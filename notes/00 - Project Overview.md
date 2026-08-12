@@ -28,6 +28,7 @@ No code — not this one, not a rewrite, not a different tool — can guarantee 
 - [[05 - Lessons Learned]] — specific gotchas hit and how they were solved
 - [[06 - Pre-Mainnet Checklist]] — what has to be true before real money is ever involved
 - [[07 - Glossary]] — plain-language definitions for the DeFi/Solidity terms used everywhere else
+- [[08 - Signer Key Generation Runbook]] — how each mainnet Safe signer generates and custodies their own key, and the real testnet incident that makes this non-optional
 
 ## Where the actual code lives
 
