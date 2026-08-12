@@ -6,13 +6,22 @@ import "../libraries/RouteData.sol";
 import "../libraries/SafeERC20.sol";
 import "../libraries/CommonErrors.sol";
 
-interface ISwapRouter {
+/// @dev SwapRouter02's IV3SwapRouter -- NOT the original v3-periphery
+/// ISwapRouter. SwapRouter02 dropped `deadline` from these structs
+/// (it handles deadlines via `multicall(uint256 deadline, bytes[])`
+/// instead), which changes the function selectors entirely. Every
+/// router address in notes/03 - Address Registry.md is SwapRouter02,
+/// confirmed by checking the deployed bytecode directly for these exact
+/// selectors -- see notes/03 for the full writeup of how the original
+/// (wrong) interface here went undetected: quote() uses QuoterV2, whose
+/// selectors are unaffected by this, so quoting always worked while
+/// swap() would have reverted on selector mismatch for every real trade.
+interface IV3SwapRouter {
     struct ExactInputSingleParams {
         address tokenIn;
         address tokenOut;
         uint24 fee;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
         uint160 sqrtPriceLimitX96;
@@ -23,7 +32,6 @@ interface ISwapRouter {
     struct ExactInputParams {
         bytes path;
         address recipient;
-        uint256 deadline;
         uint256 amountIn;
         uint256 amountOutMinimum;
     }
@@ -74,12 +82,12 @@ contract UniswapV3Adapter is IDexAdapter {
     using SafeERC20 for address;
     using RouteData for bytes;
 
-    ISwapRouter public immutable ROUTER;
+    IV3SwapRouter public immutable ROUTER;
     IQuoterV2 public immutable QUOTER;
 
     constructor(address router, address quoter) {
         if (router == address(0) || quoter == address(0)) revert ZeroAddress();
-        ROUTER = ISwapRouter(router);
+        ROUTER = IV3SwapRouter(router);
         QUOTER = IQuoterV2(quoter);
     }
 
@@ -103,12 +111,16 @@ contract UniswapV3Adapter is IDexAdapter {
         }
     }
 
+    /// @dev `deadline` is part of IDexAdapter's shared signature (V2 uses it
+    /// directly) but SwapRouter02 has no per-call deadline param -- staleness
+    /// is already bounded by the executor's own `executeBefore` check before
+    /// any adapter is ever reached, so it's intentionally unused here.
     function swap(
         bytes calldata routeData,
         uint256 amountIn,
         uint256 minAmountOut,
         address recipient,
-        uint256 deadline
+        uint256 /* deadline */
     ) external override returns (uint256 amountOut) {
         (address[] memory tokens, bytes memory extra) = routeData.decode();
         uint24[] memory fees = abi.decode(extra, (uint24[]));
@@ -120,12 +132,11 @@ contract UniswapV3Adapter is IDexAdapter {
 
         if (tokens.length == 2) {
             amountOut = ROUTER.exactInputSingle(
-                ISwapRouter.ExactInputSingleParams({
+                IV3SwapRouter.ExactInputSingleParams({
                     tokenIn: tokenIn,
                     tokenOut: tokens[1],
                     fee: fees[0],
                     recipient: recipient,
-                    deadline: deadline,
                     amountIn: amountIn,
                     amountOutMinimum: minAmountOut,
                     sqrtPriceLimitX96: 0
@@ -133,10 +144,9 @@ contract UniswapV3Adapter is IDexAdapter {
             );
         } else {
             amountOut = ROUTER.exactInput(
-                ISwapRouter.ExactInputParams({
+                IV3SwapRouter.ExactInputParams({
                     path: _encodePath(tokens, fees),
                     recipient: recipient,
-                    deadline: deadline,
                     amountIn: amountIn,
                     amountOutMinimum: minAmountOut
                 })

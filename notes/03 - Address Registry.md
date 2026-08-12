@@ -64,13 +64,32 @@ All four Base Sepolia addresses now confirmed.
 
 | Contract | Address | Notes |
 |---|---|---|
-| `DexArbitrageBotFlashLoan` (executor, **current**) | `0x9515a6e0E5e78A9C1A5cCC196800CA176FCBD486` | v13 source (post-operator-role), live. Owner is the Safe multisig below; `operator` is the bot's hot key `0xe9376a141009cF5e6C7CE357Cf595Cf3B6a7a7Aa` -- restores the bot's ability to call `requestFlashLoanArbitrage` after ownership moved to the Safe, which a single-key bot can no longer do directly (confirmed live: `estimateGas` from the bot key reverts with `AmountExceedsCap`, not `NotOperator`) |
+| `DexArbitrageBotFlashLoan` (executor, **current**) | `0x9515a6e0E5e78A9C1A5cCC196800CA176FCBD486` | v13 source (post-operator-role), live. Owner is the Safe multisig below; `operator` is `0x0E7de81E4823c69f8c0930b66f718513523abb6b`, a fresh dedicated key -- see the key-separation note below for why this changed from the deployer key |
 | `DexArbitrageBotFlashLoan` (executor, **deprecated**) | `0x0B94075406C2c004A0f80cD016E13B7211FfCE28` | **Do not use** -- source predates the `operator` role; once ownership moved to the Safe, the bot's hot key could no longer call `requestFlashLoanArbitrage` at all (`onlyOwner`, not `onlyOperator`). Superseded by the address above. |
-| `UniswapV3Adapter` | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | Unchanged, reused across both executor deployments -- wired to the confirmed SwapRouter02 + QuoterV2 above |
+| `UniswapV3Adapter` (**current**) | `0xd4c69BB515E95EE18894BDe5480ECC4627D92875` | Fixed router interface (security review finding #1, see below). Wired to the same confirmed SwapRouter02 + QuoterV2 above. Approved on the current executor, confirmed live via `isAdapterApproved()` |
+| `UniswapV3Adapter` (**deprecated, broken**) | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | **Do not use** -- `swap()` targets function selectors that don't exist on the deployed SwapRouter02, so every real swap would revert. See finding #1 below for the full writeup. `quote()` still worked, which is why this went unnoticed. |
 
 Both `approveAdapter`/`approveToken` are active on the current executor (`approvalDelay` was temporarily set to 0 for this redeploy -- a testnet-only convenience per [[04 - Deployment Runbook]] -- then left at 0 rather than restored to 24h, since restoring it retroactively re-locks already-approved items against their original approval timestamp; caught live when `isAdapterApproved`/`isTokenApproved` unexpectedly flipped back to `false` right after the restore). `maxLoanAmount` remains deliberately 0 (not called), per [[04 - Deployment Runbook]] and [[06 - Pre-Mainnet Checklist]].
 
+### UniswapV3Adapter router interface fixed (security review finding #1)
+
+The adapter's `swap()` called the *original* v3-periphery `ISwapRouter` interface (which carries `deadline` inside `ExactInputSingleParams`/`ExactInputParams`), but every router address in this registry is **SwapRouter02**, which dropped `deadline` from those structs entirely -- changing the function selectors. This meant `swap()` would revert on every real trade, on both networks, since the deployment scripts existed. It went undetected because `quote()` uses `QuoterV2`, whose selectors are unaffected, so quoting always returned plausible numbers while `maxLoanAmount = 0` meant `swap()` was never actually reached in testing.
+
+Caught by an independent security review, which confirmed the mismatch directly against live bytecode: the adapter's selectors (`0x414bf389`, `0xc04b8d59`) are absent from both deployed routers; only the SwapRouter02 selectors (`0x04e45aaf`, `0xb858183f`) are present.
+
+Fixed by replacing `ISwapRouter` with `IV3SwapRouter` (SwapRouter02's real interface, no `deadline` field -- staleness is already bounded by the executor's own `executeBefore` check before any adapter is reached) and redeploying, since `ROUTER` is `immutable`. **Independently re-verified** (not just trusting the fix): pulled the router's real bytecode via `cast code` and ran `cast selectors` on it directly -- confirms `0x04e45aaf`/`0xb858183f` are present and `0x414bf389`/`0xc04b8d59` are absent, exactly matching what the new adapter now calls.
+
+This bug would carry over unchanged to Ethereum Sepolia's `UniswapV3Adapter` (`working`, `0x90dCEa7...`) and to mainnet, since both use the same original `ISwapRouter` interface and both target real SwapRouter02 deployments -- worth fixing/redeploying there too before relying on either.
+
 **Note for next deployment**: `VERSION()` still returns `"v13"` despite the operator-role/quoteRoute/degenerate-route changes -- the header changelog and `VERSION` constant weren't bumped before this redeploy. Worth doing before the *next* one, per the contract's own stated convention ("bump this alongside any future header changelog entry so it's checkable on-chain").
+
+### Operator key separated from Safe signers (security review finding #2)
+
+An independent security review (2026-08-11) caught that the `operator` role, when first introduced, was set to `0xe9376a141009cF5e6C7CE357Cf595Cf3B6a7a7Aa` -- which is simultaneously Safe owner #1 of 3 and the deployer key. That defeated the whole point of adding `operator`: a compromise of the always-on bot host would yield both trading-submission rights *and* one of the two signatures needed for full admin control (`approveAdapter`, `withdrawToken`, `transferOwnership`).
+
+Fixed by generating a fresh, dedicated key (`0x0E7de81E4823c69f8c0930b66f718513523abb6b`, funded with 0.002 ETH for gas only, no other role) and calling `setOperator()` on it via a signed 2-of-3 Safe `execTransaction` -- confirmed live via `operator()`. `off-chain-bot/` now has its own `.env` (gitignored, matches `off-chain-bot/.env.example`'s schema) containing only this key, so the bot process never has access to anything Safe-signer-capable. Previously `off-chain-bot/` had no `.env` of its own, so running it from the repo root silently picked up the deployer/Safe-signer key from the root `.env`.
+
+**Deferred to pre-mainnet, not done now**: `0xe9376a14...` remains a Safe owner on this testnet Safe. The reviewer's full recommendation includes removing it from the Safe's owner set (`swapOwner`) too, but that's a mainnet-readiness action, not something needed to prove the testnet mechanism -- see [[06 - Pre-Mainnet Checklist]].
 
 ## ✅ Base Sepolia — Safe multisig infrastructure
 
