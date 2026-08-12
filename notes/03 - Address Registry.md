@@ -39,6 +39,58 @@ Note: WSOL here carries 18 decimals and exposes `mint`/`burn` -- consistent with
 | `UniswapV3Adapter` (deprecated, wrong QuoterV2) | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | **Do not use** — deployed with a wrong QuoterV2, `QUOTER` is immutable, can't be patched |
 | `UniswapV3Adapter` (deprecated, broken router interface) | `0x90dCEa7EcC443B96938d57758f92E24735b64800` | **Do not use** — previously labeled "working" since `quote()` functioned fine, but `swap()` targeted selectors that don't exist on the deployed SwapRouter02 (finding #1) -- would have reverted on every real trade. Superseded by the address above. |
 
+### ⚠️ Ethereum Sepolia's WETH/USDC are NOT Aave-flash-loanable
+
+Discovered on the first-ever real `requestFlashLoanArbitrage` attempt in this project (previously blocked by `maxLoanAmount = 0`): the request reverted at Aave's own `estimateGas` step with error `"27"`. Verified directly against Aave V3's `Errors.sol` source: `27 = RESERVE_INACTIVE` ("Action requires an active reserve").
+
+Root cause, independently confirmed via `getReserveData()` on Aave's Sepolia Pool (`0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951`):
+
+| Token | Our registry's address | `getReserveData()` result |
+|---|---|---|
+| WETH (Uniswap-verified) | `0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14` | All zeros -- never listed as an Aave reserve at all |
+| USDC (Uniswap-verified) | `0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238` | All zeros -- same |
+
+**Aave's Ethereum Sepolia market runs its own, entirely separate set of tokens** -- confirmed against the official `aave-address-book` repo (`AaveV3Sepolia.sol`): their own WETH (`0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c`), USDC (`0x94a9D9AC8a22534E3FaCa9F4e7F2E2cf85d5E4C8`), USDT, DAI, WBTC, etc. -- confirmed live as a real contract, self-identifying as `"WETH"`/`"WETH"`, and confirmed as an *active* Aave reserve (`getReserveData()` returns real, non-zero data including a real `aToken` address). None of Aave's own tokens match anything in this registry's Uniswap-verified token set, and no Uniswap V3 liquidity has been verified for Aave's own tokens.
+
+**Practical consequence**: a real flash loan cannot currently execute on Ethereum Sepolia using this project's verified WETH/USDC/WSOL, regardless of contract correctness -- the borrowed asset must be one Aave actually lists, and that asset would then need real Uniswap liquidity of its own (unverified, likely absent). This isn't a code bug; it's a platform-level mismatch between two different testnet ecosystems.
+
+**Base Sepolia does not have this problem** -- confirmed live: `getReserveData()` for the OP-stack WETH predeploy (`0x4200000000000000000000000000000000000006`) on Base Sepolia's Aave Pool (`0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27`) returns real, active reserve data. Because the predeploy is a protocol-standard address baked into every OP-stack chain's genesis (see [[05 - Lessons Learned]]), Aave -- like every other protocol -- naturally uses it rather than deploying a separate WETH, so there's no split between "the WETH Aave lists" and "the WETH Uniswap trades" the way there is on Ethereum Sepolia. Base Sepolia's own second-token gap has since been closed (see the Base Sepolia section above) -- but a separate network was also fully verified and deployed to, below.
+
+## ✅ Arbitrum Sepolia — confirmed live, deployed
+
+Chosen after Ethereum Sepolia's Aave/Uniswap token mismatch (above) ruled that network out for a real end-to-end test. Arbitrum Sepolia was checked specifically for the same failure mode *before* committing to a deployment -- confirmed Aave's own listed reserves have real matching Uniswap liquidity here, unlike Ethereum Sepolia.
+
+| Contract | Address | Verified via |
+|---|---|---|
+| Aave PoolAddressesProvider | `0xB25a5D144626a0D488e52AE717A051a2E9997076` | Official `aave-address-book` (`AaveV3ArbitrumSepolia.sol`) + `cast code` + `getMarketId()` returns `"Aave V3 Arbitrum Sepolia Testnet Market"` |
+| Aave Pool (resolved) | `0xBfC91D59fdAA134A4ED45f7B584cAf96D7792Eff` | `PoolAddressesProvider.getPool()` |
+| Aave's WETH (**flash-loanable**) | `0x1dF462e2712496373A347f8ad10802a5E95f053D` | Official `aave-address-book` + `cast code` + confirmed *active* reserve via `getReserveData()` (real aToken `0xf5f17EbE81E516Dc7cB38D61908EC252F150CE60`, matching the address book exactly) |
+| Aave's USDC (**flash-loanable**) | `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d` | Same treatment -- confirmed active reserve, real aToken `0x460b97BD498E1157530AEb3086301d5225b91216` |
+| Uniswap V3 SwapRouter02 | `0x101F443B4d1b059569D643917553c771E1b9663E` | Official Uniswap docs (`developers.uniswap.org`, not a search-engine summary -- a prior search result mislabeled a **mainnet** router address as this network's testnet address; caught before use, see below) + `cast code` + selector-verified (`0x04e45aaf`/`0xb858183f` present, matching this project's already-fixed adapter) |
+| Uniswap V3 Factory | `0x248AB79Bbb9bC29bB72f7Cd42F17e054Fc40188e` | Official Uniswap docs + `cast code` + self-consistency (router's own `factory()` returns this exact address) |
+| Uniswap V3 QuoterV2 | `0x2779a0CC1c3e0E44D2542EC3e79e3864Ae93Ef0B` | Official Uniswap docs + `cast code` |
+
+**WETH/USDC pool liquidity check, using Aave's exact token addresses** (the whole point -- confirming Aave's reserves and Uniswap's liquidity are for the *same* tokens, unlike Ethereum Sepolia):
+
+| Fee tier | Pool address | Liquidity |
+|---|---|---|
+| 500 (0.05%) | `0x6399919A60d6a47e9927dDc7A45fb4995A5425bc` | `8708125569160` — nonzero |
+| 3000 (0.3%) | `0x99A927D8127b7215FC11Ce1F1009e77ff8B1d1b0` | `0` — pool exists, empty |
+| 10000 (1%) | `0xecb31BcF0C3BEc43b0f074f48D55C3cC8Ff5a39B` | `765346788228264` — nonzero, deepest pool found on any of the three networks in this file |
+
+### Deployed contract instances (Arbitrum Sepolia)
+
+| Contract | Address | Notes |
+|---|---|---|
+| `DexArbitrageBotFlashLoan` (executor) | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | v13, live. Single-key owned (deployer) -- no Safe on this network. Constructor `weth` is Aave's WETH above (not any "community" WETH), confirmed via `WETH()` |
+| `UniswapV3Adapter` | `0x0B94075406C2c004A0f80cD016E13B7211FfCE28` | Already-fixed router interface from day one (deployed after security review finding #1 was fixed) -- selector-verified against the real router the same way as every other network |
+
+Adapter and both tokens (Aave's WETH + USDC) approved; `approvalDelay` set to 0 for testnet convenience (same pattern as the other networks), confirmed live via `isAdapterApproved()`/`isTokenApproved()` all returning `true`. `maxLoanAmount` remains deliberately 0.
+
+**Caught during setup, logged so it's not repeated**: a web search initially returned `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` labeled as this network's SwapRouter02 -- the *exact same address* already logged in the ❌ table below as a previously-caught wrong address (the real **Ethereum mainnet** SwapRouter02, mistakenly attributed to Ethereum Sepolia earlier in this project). Same research-only error, different network, caught the same way: didn't trust the summary, went to Uniswap's own docs directly, then verified live.
+
+**Funding note**: getting real ETH onto this network took two failed attempts before succeeding -- a faucet requiring a mainnet balance first (anti-abuse measure, blocked this testnet-only wallet), and a bridge transaction that was filled out but never actually confirmed/signed (wallet Activity tab stayed empty, balance unchanged). Third attempt -- properly confirming the Sepolia-to-Arbitrum-Sepolia bridge transaction -- worked, landing 0.02 ETH.
+
 ## ✅ Ethereum Mainnet — verified, not yet deployed against
 
 | Contract | Address |
@@ -58,8 +110,19 @@ Note: WSOL here carries 18 decimals and exposes `mint`/`burn` -- consistent with
 | Aave PoolAddressesProvider | `0xE4C23309117Aa30342BFaae6c95c6478e0A4Ad00` | `cast code` (~6.6KB bytecode returned) |
 | Uniswap V3 SwapRouter02 | `0x94cC0AaC535CCDB3C01d6787D6413C739ae12bc4` | `cast code` (~24.5KB bytecode returned) |
 | Uniswap V3 QuoterV2 | `0xC5290058841028F1614F3A6F0F5816cAd0df5E27` | `cast code` (~8.2KB bytecode returned). Sourced from the official Uniswap docs GitHub repo (`Base-Deployments.md`), cross-validated by its paired SwapRouter02 matching the address above — but still went through a live check per the rule, not trusted on source quality alone |
+| USDC (candidate token) | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | Circle's official testnet address (`developers.circle.com/stablecoins/usdc-contract-addresses`) + `cast code` + `name()`/`symbol()`/`decimals()` self-identification ("USDC"/"USDC"/6 -- 6 decimals matches genuine USDC, unlike WSOL's 18-decimal mock on Ethereum Sepolia) + real pool liquidity confirmed against WETH at all 3 fee tiers |
 
-All four Base Sepolia addresses now confirmed.
+All four original Base Sepolia addresses confirmed, plus this fifth (USDC) -- the first second-token verification on this network, closing the "more token pairs" gap flagged earlier.
+
+**WETH/USDC pool liquidity check** (same method as every other pool in this file): Factory derived self-consistently from the confirmed SwapRouter02's own `factory()` (`0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24`), then `Factory.getPool()` queried at fee tiers 500, 3000, 10000.
+
+| Fee tier | Pool address | Liquidity |
+|---|---|---|
+| 500 (0.05%) | `0x94bfc0574FF48E92cE43d495376C477B1d0EEeC0` | `448098251397` — nonzero |
+| 3000 (0.3%) | `0x46880b404CD35c165EDdefF7421019F8dD25F4Ad` | `345051610381846` — nonzero, deepest of the three |
+| 10000 (1%) | `0x4664755562152EDDa3a3073850FB62835451926a` | `57734017049` — nonzero |
+
+All three tiers have real liquidity (better coverage than Ethereum Sepolia's WETH/USDC or WETH/WSOL, which each only had liquidity at some tiers). `token0`/`token1` on the 3000-tier pool confirmed as exactly USDC/WETH, sorted by address.
 
 ### Deployed contract instances (Base Sepolia)
 

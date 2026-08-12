@@ -9,8 +9,10 @@ A flash loan arbitrage bot: borrow via Aave, swap through two DEX legs, repay, k
 ## Status right now
 
 - ✅ Compiles clean (solc + real forge-std, verified repeatedly)
-- ✅ Deployed and working on **Ethereum Sepolia** — see [[03 - Address Registry]]
-- ✅ **Deployed and live on Base Sepolia** too — `DexArbitrageBotFlashLoan` at `0x0B94075406C2c004A0f80cD016E13B7211FfCE28`, `UniswapV3Adapter` at `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E`. Adapter + WETH approvals submitted, still in their 24h cooldown; `maxLoanAmount` deliberately left at 0. Deployed via raw `cast send`, not `forge script` — see [[03 - Address Registry]] for why. See [[04 - Deployment Runbook]] for post-deploy steps still ahead.
+- ✅ **Deployed and live on three testnets**: Ethereum Sepolia, Base Sepolia, and Arbitrum Sepolia — see [[03 - Address Registry]] for every address and how each was verified. All three have `maxLoanAmount` unlocked to a small testnet cap (0.1 ETH on the first two); Arbitrum Sepolia is the only network confirmed capable of an actual end-to-end flash loan (Ethereum Sepolia's Aave reserves don't match its Uniswap-liquid tokens; Base Sepolia has no arbitrage opportunity found yet on its one verified pair).
+- ✅ Base Sepolia has a 2-of-3 **Safe multisig** as owner (Ethereum Sepolia and Arbitrum Sepolia are still single-key owned). A separate `operator` role exists so the off-chain bot's hot key never needs owner-level access — see the key-separation writeup in [[03 - Address Registry]].
+- ✅ **Independent security review completed and both findings fixed**: the V3 adapter's router interface was silently broken since early in the project (fixed + redeployed everywhere); the operator key had overlapped with a Safe signer (fixed via key rotation). Several other findings (gas-adjusted profit floor not enforced, MEV-split leak, weak relay validation, a self-deadlocking cancellation path) fixed in the off-chain bot too.
+- ✅ Off-chain bot (`off-chain-bot/index.js`) does real opportunity discovery now — protocol-aware routing (v2/v3/curve, decimals-aware, triangular routes), not just a placeholder.
 - ❌ **Mainnet: not deployed, not decided.** See [[06 - Pre-Mainnet Checklist]] before that ever happens.
 
 ## The one sentence that matters most
