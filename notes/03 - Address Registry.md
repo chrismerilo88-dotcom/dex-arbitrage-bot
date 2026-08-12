@@ -34,9 +34,10 @@ Note: WSOL here carries 18 decimals and exposes `mint`/`burn` -- consistent with
 
 | Contract | Address | Notes |
 |---|---|---|
-| `DexArbitrageBotFlashLoan` (executor) | `0x0B94075406C2c004A0f80cD016E13B7211FfCE28` | v13, live |
-| `UniswapV3Adapter` (broken) | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | **Do not use** — deployed with a wrong QuoterV2, `QUOTER` is immutable, can't be patched |
-| `UniswapV3Adapter` (working) | `0x90dCEa7EcC443B96938d57758f92E24735b64800` | Use this one |
+| `DexArbitrageBotFlashLoan` (executor) | `0x0B94075406C2c004A0f80cD016E13B7211FfCE28` | v13, live. Single-key owned (deployer) -- no Safe migration on this network |
+| `UniswapV3Adapter` (**current**) | `0x15F894EF3e8ce6156878fEc9B82564142439735C` | Fixed router interface (security review finding #1, same bug as Base Sepolia -- see that network's section for the full writeup). Approved and confirmed live via `isAdapterApproved()`. Selector-verified against the router's real bytecode the same way. |
+| `UniswapV3Adapter` (deprecated, wrong QuoterV2) | `0xaEb83a3F9ea57a88be1E0aBF473ec01c1FD1A12E` | **Do not use** — deployed with a wrong QuoterV2, `QUOTER` is immutable, can't be patched |
+| `UniswapV3Adapter` (deprecated, broken router interface) | `0x90dCEa7EcC443B96938d57758f92E24735b64800` | **Do not use** — previously labeled "working" since `quote()` functioned fine, but `swap()` targeted selectors that don't exist on the deployed SwapRouter02 (finding #1) -- would have reverted on every real trade. Superseded by the address above. |
 
 ## ✅ Ethereum Mainnet — verified, not yet deployed against
 
