@@ -7,7 +7,7 @@ import "./libraries/SafeERC20.sol";
 import "./libraries/CommonErrors.sol";
 
 /*
- * DexArbitrageBotFlashLoan (v13 - forge-lint fixes)
+ * DexArbitrageBotFlashLoan (v14 - operator role, quoteRoute hardening, adapter fixes)
  * ------------------------------------------
  * v1 -> v9 changelogs are unchanged from the previous version and omitted
  * here for brevity -- see git history. Summary of the arc so far:
@@ -138,6 +138,54 @@ import "./libraries/CommonErrors.sol";
  *     adapters to it -- which also let the now-unnecessary IERC20Min
  *     import be dropped from each of them.
  *
+ * New in v14 (deferred findings from the v13 security review, finally
+ * addressed, plus one addition found while doing it -- all of this was
+ * already live on Base Sepolia under the "v13" label before this bump;
+ * see the note on VERSION below for why):
+ *
+ * 28. NEW operator ROLE: requestFlashLoanArbitrage() required onlyOwner,
+ *     which stopped working the moment owner became a Safe multisig --
+ *     a multisig can't realistically co-sign every automated
+ *     submission. Added a separate, lower-privilege operator address
+ *     (onlyOperator: owner or operator), settable only by owner via
+ *     setOperator(), that can submit requests without any admin
+ *     capability. Lets the always-on off-chain bot hold a hot key that
+ *     can only ever trigger trades.
+ *
+ * 29. quoteRoute() HAD NO ACCESS CONTROL: anyone could call it with
+ *     arbitrary adapter1/adapter2 addresses, forcing the executor to
+ *     make external calls of the caller's choosing as its own
+ *     msg.sender. Not fund-losing on its own, but free ammunition
+ *     against any future integration that trusts a call coming from
+ *     this contract's address. Fixed by requiring both adapters already
+ *     approved, plus nonReentrant/whenNotPaused guards it was also
+ *     missing.
+ *
+ * 30. DEGENERATE ROUTE SHAPE REACHED AN OPAQUE PANIC: a route shaped
+ *     [WETH, X, WETH] (leg 1 starts and ends at the same token) made
+ *     _executeRoute's balance-delta subtraction underflow into a bare
+ *     panic instead of a named revert. Rejected explicitly in
+ *     _requireValidRoute with InvalidRoute() instead.
+ *
+ * 31. UniswapV3Adapter CALLED THE WRONG ROUTER INTERFACE: swap() used
+ *     the original v3-periphery ISwapRouter (deadline inside its
+ *     structs) against a deployed SwapRouter02, which dropped deadline
+ *     entirely -- different function selectors, so every real swap
+ *     would revert. quote() uses QuoterV2, a different interface
+ *     entirely unaffected by this, which is why it went unnoticed:
+ *     quotes always looked plausible while maxLoanAmount = 0 kept
+ *     swap() from ever actually being reached. Caught by an independent
+ *     security review checking selectors against live router bytecode
+ *     directly, not by trusting the interface's name. Fixed by
+ *     switching to IV3SwapRouter (SwapRouter02's real interface).
+ *
+ * 32. CurveAdapter'S exchange() RETURN TYPE DIDN'T MATCH THE REAL POOL:
+ *     classic Vyper StableSwap pools return nothing from exchange();
+ *     declaring a non-void return type made Solidity revert while
+ *     decoding a value the call never provided. Fixed by dropping the
+ *     declared return and measuring output via balance delta instead,
+ *     matching every other adapter's pattern.
+ *
  * NOT changed: forge-lint's three block-timestamp warnings (the two
  * approval-cooldown checks and the executeBefore deadline check). A
  * validator's ability to influence block.timestamp is on the order of
@@ -232,7 +280,7 @@ contract DexArbitrageBotFlashLoan is IFlashLoanSimpleReceiver {
     /// see CHANGELOG.md for the full history. Bump this alongside any
     /// future header changelog entry so it's checkable on-chain, not just
     /// in source comments.
-    string public constant VERSION = "v13";
+    string public constant VERSION = "v14";
 
     bool public paused;
     bool public autoSweepProfit = true;

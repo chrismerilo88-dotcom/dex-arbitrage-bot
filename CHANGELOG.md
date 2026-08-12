@@ -4,6 +4,49 @@ Version shown here matches `VERSION` on the deployed `DexArbitrageBotFlashLoan`
 contract. v1–v9 were single-file iterations before this became a multi-file
 project; v10 introduced the adapter architecture in `contracts/adapters/`.
 
+## v14 — operator role, quoteRoute hardening, adapter fixes
+Deferred findings from the v13 security review, finally addressed, plus
+one addition found while doing it. All of this was already live on Base
+Sepolia under the `v13` label before this bump — `VERSION` and this
+changelog just hadn't caught up to what was actually deployed.
+
+- **New `operator` role.** `requestFlashLoanArbitrage()` required
+  `onlyOwner`, which stopped working the moment owner became a Safe
+  multisig — a multisig can't realistically co-sign every automated
+  submission. Added a separate, lower-privilege `operator` address
+  (`onlyOperator`: owner or operator), settable only by owner via
+  `setOperator()`, that can submit requests without any admin
+  capability — lets the always-on off-chain bot hold a hot key that can
+  only ever trigger trades.
+- **`quoteRoute()` had no access control.** Anyone could call it with
+  arbitrary `adapter1`/`adapter2` addresses, forcing the executor to make
+  external calls of the caller's choosing as its own `msg.sender`. Not
+  fund-losing on its own, but free ammunition against any future
+  integration that trusts a call coming from this contract's address.
+  Fixed by requiring both adapters already approved, plus the
+  `nonReentrant`/`whenNotPaused` guards it was also missing.
+- **Degenerate route shape reached an opaque panic.** A route shaped
+  `[WETH, X, WETH]` (leg 1 starts and ends at the same token) made
+  `_executeRoute`'s balance-delta subtraction underflow into a bare
+  panic instead of a named revert. Rejected explicitly now, with
+  `InvalidRoute()`.
+- **`UniswapV3Adapter` called the wrong router interface.** `swap()` used
+  the original v3-periphery `ISwapRouter` (`deadline` inside its
+  structs) against a deployed SwapRouter02, which dropped `deadline`
+  entirely — different function selectors, so every real swap would
+  revert. `quote()` uses `QuoterV2`, a different interface entirely
+  unaffected by this, which is why it went unnoticed: quotes always
+  looked plausible while `maxLoanAmount = 0` kept `swap()` from ever
+  actually being reached. Caught by an independent security review
+  checking selectors against live router bytecode directly. Fixed by
+  switching to `IV3SwapRouter` (SwapRouter02's real interface).
+- **`CurveAdapter`'s `exchange()` return type didn't match the real
+  pool.** Classic Vyper StableSwap pools return nothing from
+  `exchange()`; declaring a non-`void` return type made Solidity revert
+  while decoding a value the call never provided. Fixed by dropping the
+  declared return and measuring output via balance delta instead,
+  matching every other adapter's pattern.
+
 ## v13 — forge-lint fixes
 Surfaced by forge's built-in linter and a real "stack too deep" compiler
 limit, both only visible once the project was actually built with real
