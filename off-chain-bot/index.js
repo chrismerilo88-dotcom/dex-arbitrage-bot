@@ -9,11 +9,13 @@
  * and (2) tryRoute() -- verifies profitability against live chain state
  * via quoteRoute() before spending any gas, then submits the request.
  *
- * This is a real, working scanner, but not a production one -- it has
- * no local reserve math, so every candidate costs a real network round
- * trip (batched, see SCAN_CONCURRENCY), and even in WATCH_MODE it reacts
- * to confirmed blocks, not pending mempool transactions. See the
- * "Opportunity discovery" section comment for exactly what's covered.
+ * This is a real, working scanner, but not a production one -- local
+ * reserve math (see prefilterCandidates() below) cuts the number of
+ * candidates that reach a full quoteRoute() simulation, but it's a
+ * spot-price approximation, not concentrated-liquidity-aware, and even
+ * in WATCH_MODE it reacts to confirmed blocks, not pending mempool
+ * transactions. See the "Opportunity discovery" section comment for
+ * exactly what's covered.
  *
  * Usage:
  *   npm install
@@ -39,6 +41,20 @@ const ERC20_ABI = ['function decimals() view returns (uint8)'];
 // immutable pool actually trades. See CurveAdapter.sol's own caveat: this
 // matches classic stable-pool style (e.g. 3pool) only.
 const CURVE_POOL_ABI = ['function coins(uint256 index) view returns (address)'];
+
+// Minimal read-only ABIs for the local reserve-math pre-filter (see
+// prefilterCandidates() below) -- just enough to read a pool's current
+// spot price without simulating a swap.
+const V3_FACTORY_ABI = ['function getPool(address tokenA, address tokenB, uint24 fee) view returns (address)'];
+const V3_POOL_ABI = [
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  'function token0() view returns (address)',
+];
+const V2_FACTORY_ABI = ['function getPair(address tokenA, address tokenB) view returns (address)'];
+const V2_PAIR_ABI = [
+  'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
+  'function token0() view returns (address)',
+];
 
 // JsonRpcProvider only speaks HTTP(S) -- a wss:// URL needs
 // WebSocketProvider instead. Matters most for WATCH_MODE: block events
@@ -371,13 +387,22 @@ async function cancelStuckTransaction(nonce) {
 //    notes/03 - Address Registry.md) is used as BORROWED_ASSET --
 //    ethers.parseEther would otherwise be off by 10^12.
 //
-// Still not a production scanner even with all four: it has no local
-// reserve math, so every candidate costs a real network round trip
-// (batched via SCAN_CONCURRENCY to avoid hammering the RPC provider --
-// see rankCandidates() below), and candidate count grows combinatorially
-// with how many adapters/via-tokens/fee-tiers you configure. Keep that
-// list deliberately scoped to what's actually approved and worth
-// checking, not "everything you can think of."
+// Still not a production scanner even with all four: candidate count still
+// grows combinatorially with how many adapters/via-tokens/fee-tiers you
+// configure. Two things now cap what that growth actually costs:
+//   - prefilterCandidates() (optional -- set V3_FACTORY_ADDRESS and/or
+//     V2_FACTORY_ADDRESS to enable) reads one cheap spot-price per unique
+//     hop (slot0()/getReserves(), not a swap simulation) and keeps only
+//     the top PREFILTER_TOP_N candidates by rough estimated profit.
+//   - rankCandidates() below still quotes whatever survives that (or
+//     everything, if the pre-filter is off) via the real, authoritative
+//     quoteRoute(), batched via SCAN_CONCURRENCY to avoid hammering the
+//     RPC provider.
+// The pre-filter is a ranking approximation, not a substitute for
+// quoteRoute() -- see prefilterCandidates()'s own doc comment for exactly
+// what it ignores (concentrated-liquidity depth, tick-crossing). Keep the
+// adapter/via-token list deliberately scoped to what's actually approved
+// and worth checking either way, not "everything you can think of."
 // ---------------------------------------------------------------------
 
 const KNOWN_PROTOCOLS = new Set(['v2', 'v3', 'curve', 'balancer']);
@@ -460,6 +485,13 @@ function buildTwoLegCandidates({ genericAdapters, borrowedAsset, viaTokens, feeT
             routeData2: encodeForProtocol(adapter2.protocol, [viaToken, borrowedAsset], [feeBack]),
             minProfit,
             slippageBps,
+            // Per-hop metadata for prefilterCandidates() below -- not used
+            // by tryRoute()/rankCandidates(), which only ever look at the
+            // already-encoded routeData.
+            _hops: [
+              { protocol: adapter1.protocol, tokenIn: borrowedAsset, tokenOut: viaToken, fee: feeOut },
+              { protocol: adapter2.protocol, tokenIn: viaToken, tokenOut: borrowedAsset, fee: feeBack },
+            ],
           });
         }
       }
@@ -501,6 +533,11 @@ function buildTriangularCandidates({ genericAdapters, borrowedAsset, viaTokens, 
               routeData2: encodeForProtocol(adapter2.protocol, [viaA, viaB, borrowedAsset], feeBackPair),
               minProfit,
               slippageBps,
+              _hops: [
+                { protocol: adapter1.protocol, tokenIn: borrowedAsset, tokenOut: viaA, fee: feeOut },
+                { protocol: adapter2.protocol, tokenIn: viaA, tokenOut: viaB, fee: feeBackPair[0] },
+                { protocol: adapter2.protocol, tokenIn: viaB, tokenOut: borrowedAsset, fee: feeBackPair[1] },
+              ],
             });
           }
         }
@@ -516,6 +553,11 @@ function buildTriangularCandidates({ genericAdapters, borrowedAsset, viaTokens, 
               routeData2: encodeForProtocol(adapter2.protocol, [viaB, borrowedAsset], [feeBack]),
               minProfit,
               slippageBps,
+              _hops: [
+                { protocol: adapter1.protocol, tokenIn: borrowedAsset, tokenOut: viaA, fee: feeOutPair[0] },
+                { protocol: adapter1.protocol, tokenIn: viaA, tokenOut: viaB, fee: feeOutPair[1] },
+                { protocol: adapter2.protocol, tokenIn: viaB, tokenOut: borrowedAsset, fee: feeBack },
+              ],
             });
           }
         }
@@ -568,11 +610,167 @@ async function resolveCurveCandidates(curveAdapters, borrowedAsset, provider, { 
   return candidates;
 }
 
-async function buildCandidates(config) {
-  const candidates = buildTwoLegCandidates(config);
-  if (config.viaTokens.length >= 2) {
-    candidates.push(...buildTriangularCandidates(config));
+// Resolved once per process and cached forever -- a pool's ADDRESS at a
+// given (protocol, tokenA, tokenB, fee) doesn't change block to block, so
+// re-deriving it via factory.getPool()/getPair() on every WATCH_MODE pass
+// would just be wasted RPC calls. The pool's PRICE is a different story
+// (see resolveHopPrice()/prefilterCandidates() below) -- that's never
+// cached across passes, since staleness there would defeat the point.
+const poolAddressCache = new Map();
+
+async function resolvePoolAddress(protocol, tokenA, tokenB, fee, factoryAddress) {
+  const key = `${protocol}:${tokenA.toLowerCase()}:${tokenB.toLowerCase()}:${fee || 0}`;
+  if (poolAddressCache.has(key)) return poolAddressCache.get(key);
+
+  const poolAddress =
+    protocol === 'v3'
+      ? await new ethers.Contract(factoryAddress, V3_FACTORY_ABI, provider).getPool(tokenA, tokenB, fee)
+      : await new ethers.Contract(factoryAddress, V2_FACTORY_ABI, provider).getPair(tokenA, tokenB);
+
+  const resolved = poolAddress === ethers.ZeroAddress ? null : poolAddress;
+  poolAddressCache.set(key, resolved);
+  return resolved;
+}
+
+/**
+ * Fetches one hop's current price, cheaply -- slot0() for v3 (a single
+ * storage read) or getReserves() for v2 -- instead of the full swap
+ * simulation quoteRoute()/QuoterV2 does. Returns null when there's no
+ * pool at all for this (protocol, tokenIn, tokenOut, fee) combination.
+ */
+async function resolveHopPrice(protocol, tokenIn, tokenOut, fee, factoryAddress) {
+  const poolAddress = await resolvePoolAddress(protocol, tokenIn, tokenOut, fee, factoryAddress);
+  if (!poolAddress) return null;
+
+  if (protocol === 'v3') {
+    const pool = new ethers.Contract(poolAddress, V3_POOL_ABI, provider);
+    const [slot0, token0] = await Promise.all([pool.slot0(), pool.token0()]);
+    return { protocol, fee, token0: token0.toLowerCase(), sqrtPriceX96: slot0.sqrtPriceX96 };
   }
+
+  const pair = new ethers.Contract(poolAddress, V2_PAIR_ABI, provider);
+  const [reserves, token0] = await Promise.all([pair.getReserves(), pair.token0()]);
+  return { protocol, token0: token0.toLowerCase(), reserve0: reserves.reserve0, reserve1: reserves.reserve1 };
+}
+
+const Q192 = 2n ** 96n * 2n ** 96n;
+
+/**
+ * Applies a cached hop price to a specific amountIn -- pure computation,
+ * no RPC. v3 uses the pool's current spot price only: it ignores
+ * concentrated-liquidity depth and tick-crossing entirely (unlike the
+ * real QuoterV2 path), trading accuracy for a read that costs one
+ * slot0() instead of a full swap simulation -- correct in the
+ * infinite-depth limit, and directionally useful for ranking, but not a
+ * substitute for the real quote. v2's constant-product formula, by
+ * contrast, IS exact for this reserve snapshot (no approximation).
+ * Returns null when the pool has zero reserves on one side.
+ */
+function applyHopPrice(hop, price, amountIn) {
+  if (price.protocol === 'v3') {
+    const priceX192 = price.sqrtPriceX96 * price.sqrtPriceX96;
+    const rawOut =
+      price.token0 === hop.tokenIn.toLowerCase() ? (amountIn * priceX192) / Q192 : (amountIn * Q192) / priceX192;
+    return (rawOut * BigInt(1_000_000 - hop.fee)) / 1_000_000n;
+  }
+
+  const [reserveIn, reserveOut] =
+    price.token0 === hop.tokenIn.toLowerCase() ? [price.reserve0, price.reserve1] : [price.reserve1, price.reserve0];
+  if (reserveIn === 0n || reserveOut === 0n) return null;
+  const amountInWithFee = amountIn * 997n;
+  return (amountInWithFee * reserveOut) / (reserveIn * 1000n + amountInWithFee);
+}
+
+function hopKey(hop) {
+  return `${hop.protocol}:${hop.tokenIn.toLowerCase()}:${hop.tokenOut.toLowerCase()}:${hop.fee || 0}`;
+}
+
+/**
+ * Cheap local ranking pass before the expensive, authoritative
+ * quoteRoute() check: fetches ONE price per unique hop across the whole
+ * candidate set (not one per candidate -- the same via-token/fee hop
+ * shows up in many candidates, e.g. every adapter-pair variant routing
+ * through the same via-token at the same fee tier), chains those prices
+ * to estimate each candidate's round-trip output, and keeps only the top
+ * prefilterTopN. This is a RANKING signal only -- see applyHopPrice()'s
+ * doc comment for why it can rank a real winner below a candidate that
+ * later reverts or quotes worse. rankCandidates() still runs the real
+ * quoteRoute() on whatever this returns, and still decides everything
+ * about submission.
+ *
+ * A no-op (returns candidates unchanged) when neither factory address is
+ * configured, or when there aren't more candidates than prefilterTopN
+ * already -- so leaving V3_FACTORY_ADDRESS/V2_FACTORY_ADDRESS unset keeps
+ * today's exact behavior, no breaking change.
+ */
+async function prefilterCandidates(candidates, config) {
+  const { v3FactoryAddress, v2FactoryAddress, prefilterTopN, concurrency } = config;
+  if ((!v3FactoryAddress && !v2FactoryAddress) || candidates.length <= prefilterTopN) {
+    return candidates;
+  }
+  console.log(`pre-filtering ${candidates.length} candidate(s) down to the top ${prefilterTopN} by local reserve math before quoting...`);
+
+  const uniqueHops = new Map();
+  for (const c of candidates) {
+    for (const hop of c._hops) {
+      const factoryAddress = hop.protocol === 'v3' ? v3FactoryAddress : hop.protocol === 'v2' ? v2FactoryAddress : null;
+      if (!factoryAddress) continue;
+      uniqueHops.set(hopKey(hop), { hop, factoryAddress });
+    }
+  }
+
+  const priceCache = new Map(); // hopKey -> price descriptor, or null if unresolvable
+  const hopEntries = [...uniqueHops.entries()];
+  for (let i = 0; i < hopEntries.length; i += concurrency) {
+    const batch = hopEntries.slice(i, i + concurrency);
+    await Promise.all(
+      batch.map(async ([key, { hop, factoryAddress }]) => {
+        priceCache.set(key, await resolveHopPrice(hop.protocol, hop.tokenIn, hop.tokenOut, hop.fee, factoryAddress));
+      })
+    );
+  }
+
+  const scored = candidates.map((c) => {
+    let amount = c.amount;
+    for (const hop of c._hops) {
+      const price = priceCache.get(hopKey(hop));
+      if (!price) {
+        amount = null;
+        break;
+      }
+      amount = applyHopPrice(hop, price, amount);
+      if (amount === null) break;
+    }
+    return { ...c, _roughProfit: amount === null ? null : amount - c.amount };
+  });
+
+  // Candidates whose hops couldn't be priced at all (no pool at that fee
+  // tier, or a protocol this pre-filter doesn't cover) can't be ranked --
+  // cluster them at the bottom instead of dropping them outright, so a
+  // real-but-unpriced route still gets a shot at the top N when there's
+  // room, same as it always could before this pre-filter existed.
+  scored.sort((a, b) => {
+    if (a._roughProfit === null && b._roughProfit === null) return 0;
+    if (a._roughProfit === null) return 1;
+    if (b._roughProfit === null) return -1;
+    return b._roughProfit > a._roughProfit ? 1 : b._roughProfit < a._roughProfit ? -1 : 0;
+  });
+
+  return scored.slice(0, prefilterTopN);
+}
+
+async function buildCandidates(config) {
+  const genericCandidates = buildTwoLegCandidates(config);
+  if (config.viaTokens.length >= 2) {
+    genericCandidates.push(...buildTriangularCandidates(config));
+  }
+
+  const candidates = await prefilterCandidates(genericCandidates, config);
+
+  // Curve candidates bypass the pre-filter entirely: there's at most one
+  // per curve-tagged adapter (resolveCurveCandidates() doesn't search a
+  // via-token space the way the generic builders do), so they were never
+  // the source of combinatorial RPC load this pre-filter exists to cut.
   if (config.curveAdapters.length > 0) {
     candidates.push(...(await resolveCurveCandidates(config.curveAdapters, config.borrowedAsset, provider, config)));
   }
@@ -647,6 +845,13 @@ async function loadScanConfig() {
     minProfit: ethers.parseUnits(process.env.MIN_PROFIT || '0.01', decimals),
     slippageBps: Number(process.env.SLIPPAGE_BPS || 300),
     concurrency: Number(process.env.SCAN_CONCURRENCY || 20),
+    // Local reserve-math pre-filter (see prefilterCandidates() above) --
+    // both optional. Leaving them unset disables the pre-filter entirely,
+    // so every candidate still reaches the real quoteRoute() check exactly
+    // as before this feature existed.
+    v3FactoryAddress: process.env.V3_FACTORY_ADDRESS || null,
+    v2FactoryAddress: process.env.V2_FACTORY_ADDRESS || null,
+    prefilterTopN: Number(process.env.PREFILTER_TOP_N || 25),
   };
 }
 
