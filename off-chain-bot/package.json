@@ -4,7 +4,8 @@
   "description": "Skeleton off-chain caller for DexArbitrageBotFlashLoan -- see index.js for what's real vs. placeholder.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "dependencies": {
     "ethers": "6.17.0",
