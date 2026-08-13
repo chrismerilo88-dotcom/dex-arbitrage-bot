@@ -88,6 +88,19 @@ const MAX_DAILY_GAS_SPEND_ETH = process.env.MAX_DAILY_GAS_SPEND_ETH ? ethers.par
 // watching in real time.
 const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL || null;
 
+// How much time a submitted request gets, in seconds -- the two
+// separate deadlines tryRoute() sets on every request. Previously
+// hardcoded (120 / 300); externalized because they're genuine
+// risk/latency tradeoffs (a slower/more congested network, or a
+// deliberately wider staleness tolerance, are both legitimate reasons
+// to change these) rather than mechanical implementation details.
+const EXECUTE_BEFORE_SECONDS = Number(process.env.EXECUTE_BEFORE_SECONDS || 120); // request reverts if it lands after this
+const DEADLINE_SECONDS = Number(process.env.DEADLINE_SECONDS || 300); // per-adapter router-call deadline window
+// Percentage (125 = 25% headroom) applied to the gas-adjusted profit
+// floor -- see its use in tryRoute() for exactly what blind spots this
+// covers. Also externalized for the same reason as the two above.
+const GAS_HEADROOM_PCT = BigInt(process.env.GAS_HEADROOM_PCT || 125);
+
 const EXECUTOR_ABI = [
   'function quoteRoute(uint256 amount, address adapter1, bytes routeData1, address adapter2, bytes routeData2) returns (uint256 netProfit)',
   'function requestFlashLoanArbitrage(uint256 amount, address adapter1, bytes routeData1, address adapter2, bytes routeData2, uint256 minProfit, uint256 slippageBps, uint256 deadlineSeconds, uint256 executeBefore) external',
@@ -297,8 +310,8 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
   // NTP) would otherwise cause either instant RequestExpired reverts or
   // a much wider staleness window than intended.
   const { timestamp: chainTimestamp } = await submitProvider.getBlock('latest');
-  const executeBefore = chainTimestamp + 120; // 2 min to land
-  const deadlineSeconds = 300;
+  const executeBefore = chainTimestamp + EXECUTE_BEFORE_SECONDS;
+  const deadlineSeconds = DEADLINE_SECONDS;
 
   // Gas-adjusted threshold: minProfit alone doesn't account for what this
   // specific request will actually cost to land. gasCostWei is
@@ -352,10 +365,10 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
       return;
     }
     const feeData = await submitProvider.getFeeData();
-    // 25% headroom: the on-chain gas backstop only measures executeOperation's
+    // Headroom: the on-chain gas backstop only measures executeOperation's
     // own gas, not the outer tx's base cost, calldata cost, or Aave's
     // pre/post bookkeeping -- this estimate has the same blind spots.
-    const gasCostWei = (gasEstimate * feeData.maxFeePerGas * 125n) / 100n;
+    const gasCostWei = (gasEstimate * feeData.maxFeePerGas * GAS_HEADROOM_PCT) / 100n;
     effectiveMinProfit = minProfit + gasCostWei;
   }
 
