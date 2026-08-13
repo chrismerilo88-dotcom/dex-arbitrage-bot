@@ -8,3 +8,5 @@ cache/
 broadcast/
 node_modules/
 .claude/*.local.md
+shared/data/
+shared/logs/

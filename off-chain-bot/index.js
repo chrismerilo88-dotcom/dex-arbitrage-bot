@@ -25,6 +25,14 @@
  * The pure logic (route encoding, candidate building, the pre-filter's
  * math) lives in lib.js, split out specifically so it can be unit tested
  * without a live provider/wallet -- see lib.test.js, run via `npm test`.
+ *
+ * Every attempt (skipped, dry-run, submitted, confirmed, reverted) is
+ * recorded to shared/data/bot.db (see ../shared/db.js) and logged
+ * structurally (see ../shared/logger.js) -- both shared with
+ * monitoring/, so a Telegram /status command there can report on scans
+ * this process runs, even though they're separate OS processes. DRY_RUN
+ * and the off-chain circuit breaker (MAX_CONSECUTIVE_FAILURES /
+ * MAX_DAILY_GAS_SPEND_ETH) both live in tryRoute() -- see .env.example.
  */
 
 require('dotenv').config();
@@ -40,6 +48,45 @@ const {
   hopKey,
   applyHopPrice,
 } = require('./lib');
+const db = require('../shared/db');
+const { createLogger } = require('../shared/logger');
+
+const log = createLogger('off-chain-bot');
+
+// A human-readable label for whatever network RPC_URL actually points
+// at -- used to tag every DB row and log line, and to scope the circuit
+// breaker's daily-gas-spend and consecutive-failure counters per
+// network (a bad run on one testnet shouldn't block submissions on
+// another). No live way to derive a friendly name from a chain ID alone
+// (would need a hardcoded id->name table, one more thing to keep in
+// sync with the address registry), so this is just supplied directly.
+const NETWORK_LABEL = process.env.NETWORK_LABEL || 'unlabeled-network';
+
+// Dry-run: runs every real on-chain check (quoteRoute, gas estimate)
+// exactly as normal, but stops short of the actual
+// requestFlashLoanArbitrage() call. Answers "would this have been
+// profitable" using real chain state, for zero gas and zero risk --
+// see tryRoute()'s submission block for where this branches.
+const DRY_RUN = process.env.DRY_RUN === 'true';
+
+// Off-chain circuit breaker -- see checkCircuitBreaker()/tripCircuitBreakerIfNeeded()
+// below. A consecutive-loss (or consecutive-revert) breaker is
+// structurally impossible to implement on-chain (a reverted transaction
+// leaves no trace for a future call to read), so it belongs here.
+const MAX_CONSECUTIVE_FAILURES = Number(process.env.MAX_CONSECUTIVE_FAILURES || 5);
+// Unset (0) by default -- deliberately opt-in, since a meaningful ETH
+// figure depends entirely on the user's own risk tolerance and this
+// network's real value, not something safe to default for them (same
+// reasoning as maxLoanAmount starting at 0 on the contract itself).
+const MAX_DAILY_GAS_SPEND_ETH = process.env.MAX_DAILY_GAS_SPEND_ETH ? ethers.parseEther(process.env.MAX_DAILY_GAS_SPEND_ETH) : 0n;
+// Optional -- POSTs a {text, content} payload (Slack/Discord-compatible,
+// same shape as monitoring/monitor.js's webhook) the moment the circuit
+// breaker actually trips. Separate from monitor.js's own webhook since
+// this fires from inside a submission attempt, not from watching chain
+// events -- a tripped breaker is exactly the kind of thing worth an
+// immediate phone notification for, not just a log line nobody's
+// watching in real time.
+const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL || null;
 
 const EXECUTOR_ABI = [
   'function quoteRoute(uint256 amount, address adapter1, bytes routeData1, address adapter2, bytes routeData2) returns (uint256 netProfit)',
@@ -146,12 +193,71 @@ async function assertSubmissionSetupIsSafe() {
   }
 }
 
+/** POSTs a critical alert -- best-effort, never lets a notification failure interrupt the caller (same isolation principle as monitoring/monitor.js's sendWebhook). */
+async function sendAlert(message) {
+  if (!ALERT_WEBHOOK_URL) return;
+  try {
+    const res = await fetch(ALERT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: message, content: message }),
+    });
+    if (!res.ok) log.error(`alert webhook POST failed: ${res.status} ${res.statusText}`);
+  } catch (err) {
+    log.error('alert webhook POST threw', { error: String(err) });
+  }
+}
+
+/**
+ * Checked at the very top of tryRoute(), before any RPC call -- a
+ * tripped breaker means don't even quote, let alone submit. Returns
+ * true if halted.
+ */
+function isCircuitBreakerHalted() {
+  return Boolean(db.getCircuitBreakerState().halted);
+}
+
+/**
+ * Checked after every real on-chain outcome (revert, timeout) -- trips
+ * the breaker on either MAX_CONSECUTIVE_FAILURES back-to-back failures
+ * or crossing MAX_DAILY_GAS_SPEND_ETH (if set), and alerts immediately.
+ * No auto-reset -- see resumeCircuitBreaker()'s doc comment in
+ * shared/db.js for why a tripped breaker needs a human, not a timer.
+ */
+async function tripCircuitBreakerIfNeeded() {
+  const failures = db.consecutiveFailures(NETWORK_LABEL);
+  if (failures >= MAX_CONSECUTIVE_FAILURES) {
+    const reason = `${failures} consecutive failures on ${NETWORK_LABEL} (limit ${MAX_CONSECUTIVE_FAILURES})`;
+    db.haltCircuitBreaker(reason);
+    log.error(`CIRCUIT BREAKER TRIPPED: ${reason}`);
+    await sendAlert(`🛑 Circuit breaker tripped on ${NETWORK_LABEL}: ${reason}. Bot will not submit further requests until manually resumed.`);
+    return;
+  }
+
+  if (MAX_DAILY_GAS_SPEND_ETH > 0n) {
+    const spent = db.dailyGasSpendWei(NETWORK_LABEL);
+    if (spent >= MAX_DAILY_GAS_SPEND_ETH) {
+      const reason = `daily gas spend ${ethers.formatEther(spent)} ETH on ${NETWORK_LABEL} reached the ${ethers.formatEther(MAX_DAILY_GAS_SPEND_ETH)} ETH cap`;
+      db.haltCircuitBreaker(reason);
+      log.error(`CIRCUIT BREAKER TRIPPED: ${reason}`);
+      await sendAlert(`🛑 Circuit breaker tripped on ${NETWORK_LABEL}: ${reason}. Bot will not submit further requests until manually resumed.`);
+    }
+  }
+}
+
 /**
  * Checks one candidate route and submits it if it clears minProfit.
  * This is the part every scanner calls once it *thinks* it found
  * something -- it does not itself decide what to check.
  */
 async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, minProfit, slippageBps }, decimals, isBorrowedAssetWeth) {
+  if (isCircuitBreakerHalted()) {
+    const state = db.getCircuitBreakerState();
+    log.warn(`circuit breaker is halted (${state.haltedReason}), skipping this candidate entirely`);
+    db.recordAttempt({ network: NETWORK_LABEL, adapter1, adapter2, amount: amount.toString(), outcome: 'circuit_breaker_halted' });
+    return;
+  }
+
   // Read-only checks first -- cheap, and avoid a doomed request.
   const [adapter1Ok, adapter2Ok, cap] = await Promise.all([
     bot.isAdapterApproved(adapter1),
@@ -159,11 +265,13 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
     bot.maxLoanAmount(),
   ]);
   if (!adapter1Ok || !adapter2Ok) {
-    console.log('adapter not approved (or still in cooldown), skipping');
+    log.info('adapter not approved (or still in cooldown), skipping');
+    db.recordAttempt({ network: NETWORK_LABEL, adapter1, adapter2, amount: amount.toString(), outcome: 'skipped_adapter_not_approved' });
     return;
   }
   if (amount > cap) {
-    console.log(`amount ${amount} exceeds maxLoanAmount ${cap}, skipping`);
+    log.info(`amount ${amount} exceeds maxLoanAmount ${cap}, skipping`);
+    db.recordAttempt({ network: NETWORK_LABEL, adapter1, adapter2, amount: amount.toString(), outcome: 'skipped_cap' });
     return;
   }
 
@@ -181,7 +289,7 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
   // submission onto a private relay in the first place.
   const netProfit = await botSubmit.quoteRoute.staticCall(amount, adapter1, routeData1, adapter2, routeData2);
 
-  console.log(`quoted net profit: ${ethers.formatUnits(netProfit, decimals)} (borrowed-asset units)`);
+  log.info(`quoted net profit: ${ethers.formatUnits(netProfit, decimals)} (borrowed-asset units)`);
 
   // Derived from chain time, not the host's local clock (Date.now()) --
   // block.timestamp is what executeBefore is actually compared against
@@ -204,17 +312,45 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
   // backstop's own documented limitation.
   let effectiveMinProfit = minProfit;
   if (isBorrowedAssetWeth) {
-    const gasEstimate = await botSubmit.requestFlashLoanArbitrage.estimateGas(
-      amount,
-      adapter1,
-      routeData1,
-      adapter2,
-      routeData2,
-      minProfit,
-      slippageBps,
-      deadlineSeconds,
-      executeBefore
-    );
+    let gasEstimate;
+    try {
+      // estimateGas simulates the real call -- if the trade would
+      // actually revert on execution (most commonly InsufficientReturn(),
+      // a real quote-to-execution gap; see the contract's own doc
+      // comment on that error), this throws here, before anything is
+      // sent. That's the whole safety mechanism working as intended --
+      // but previously nothing caught it, so it crashed the entire
+      // process uncaught in one-shot mode (WATCH_MODE's outer per-block
+      // catch papered over it, at the cost of silently losing every
+      // other candidate that pass would have checked). Caught explicitly
+      // now: this is a normal, expected outcome to record and move on
+      // from, not a fatal error -- especially load-bearing for DRY_RUN
+      // mode, whose entire point is running unattended for a long
+      // stretch without dying on the first near-miss.
+      gasEstimate = await botSubmit.requestFlashLoanArbitrage.estimateGas(
+        amount,
+        adapter1,
+        routeData1,
+        adapter2,
+        routeData2,
+        minProfit,
+        slippageBps,
+        deadlineSeconds,
+        executeBefore
+      );
+    } catch (err) {
+      log.info(`gas estimate reverted (would fail on real execution): ${err.shortMessage || err.message}, skipping`);
+      db.recordAttempt({
+        network: NETWORK_LABEL,
+        adapter1,
+        adapter2,
+        amount: amount.toString(),
+        quotedNetProfit: netProfit.toString(),
+        outcome: 'skipped_would_revert',
+        errorMessage: err.shortMessage || err.message,
+      });
+      return;
+    }
     const feeData = await submitProvider.getFeeData();
     // 25% headroom: the on-chain gas backstop only measures executeOperation's
     // own gas, not the outer tx's base cost, calldata cost, or Aave's
@@ -224,9 +360,30 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
   }
 
   if (netProfit < effectiveMinProfit) {
-    console.log(
+    log.info(
       `below gas-adjusted threshold (minProfit ${ethers.formatUnits(minProfit, decimals)} + est. gas headroom ${ethers.formatUnits(effectiveMinProfit - minProfit, decimals)}), skipping`
     );
+    db.recordAttempt({
+      network: NETWORK_LABEL,
+      adapter1,
+      adapter2,
+      amount: amount.toString(),
+      quotedNetProfit: netProfit.toString(),
+      outcome: 'skipped_below_threshold',
+    });
+    return;
+  }
+
+  if (DRY_RUN) {
+    log.info(`DRY_RUN: would have submitted (quoted net profit ${ethers.formatUnits(netProfit, decimals)} clears the gas-adjusted threshold) -- not sending a real transaction`);
+    db.recordAttempt({
+      network: NETWORK_LABEL,
+      adapter1,
+      adapter2,
+      amount: amount.toString(),
+      quotedNetProfit: netProfit.toString(),
+      outcome: 'dry_run',
+    });
     return;
   }
 
@@ -254,20 +411,86 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
     deadlineSeconds,
     executeBefore
   );
-  console.log('submitted:', tx.hash);
+  log.info('submitted', { txHash: tx.hash });
+  db.recordAttempt({
+    network: NETWORK_LABEL,
+    adapter1,
+    adapter2,
+    amount: amount.toString(),
+    quotedNetProfit: netProfit.toString(),
+    outcome: 'submitted',
+    txHash: tx.hash,
+  });
+
   try {
+    // ethers v6 throws CALL_EXCEPTION here (not a resolved receipt with
+    // status 0) when the transaction confirms but reverts on-chain --
+    // verified directly against ethers' own source (provider.js's
+    // checkReceipt()) rather than assumed, since getting this branch
+    // wrong would mean a real on-chain revert never reaches the circuit
+    // breaker at all.
     const receipt = await tx.wait(1, CONFIRMATION_TIMEOUT_MS);
-    console.log('confirmed in block', receipt.blockNumber);
+    log.info('confirmed', { blockNumber: receipt.blockNumber, txHash: tx.hash });
+    const gasPrice = receipt.gasPrice ?? receipt.effectiveGasPrice ?? 0n;
+    db.recordAttempt({
+      network: NETWORK_LABEL,
+      adapter1,
+      adapter2,
+      amount: amount.toString(),
+      quotedNetProfit: netProfit.toString(),
+      outcome: 'confirmed',
+      gasUsedWei: receipt.gasUsed.toString(),
+      gasCostWei: (receipt.gasUsed * gasPrice).toString(),
+      txHash: tx.hash,
+    });
   } catch (err) {
-    // Without a timeout, a bundle that never lands on a private relay
-    // leaves this process blocked indefinitely with a consumed nonce,
-    // stalling every subsequent submission behind it. On timeout, free
-    // the nonce with a 0-value self-transfer at a bumped fee, so the
-    // next scan pass isn't stuck behind a tx that may never confirm.
-    if (err.code === 'TIMEOUT') {
-      console.error(`tx ${tx.hash} did not confirm within ${CONFIRMATION_TIMEOUT_MS}ms, cancelling nonce ${tx.nonce}`);
+    if (err.code === 'CALL_EXCEPTION' && err.receipt) {
+      const { receipt } = err;
+      const gasPrice = receipt.gasPrice ?? receipt.effectiveGasPrice ?? 0n;
+      log.error('reverted on-chain', { blockNumber: receipt.blockNumber, txHash: tx.hash });
+      db.recordAttempt({
+        network: NETWORK_LABEL,
+        adapter1,
+        adapter2,
+        amount: amount.toString(),
+        quotedNetProfit: netProfit.toString(),
+        outcome: 'failed_revert_onchain',
+        gasUsedWei: receipt.gasUsed.toString(),
+        gasCostWei: (receipt.gasUsed * gasPrice).toString(),
+        txHash: tx.hash,
+        errorMessage: err.shortMessage || err.message,
+      });
+      await tripCircuitBreakerIfNeeded();
+    } else if (err.code === 'TIMEOUT') {
+      // Without a timeout, a bundle that never lands on a private relay
+      // leaves this process blocked indefinitely with a consumed nonce,
+      // stalling every subsequent submission behind it. On timeout, free
+      // the nonce with a 0-value self-transfer at a bumped fee, so the
+      // next scan pass isn't stuck behind a tx that may never confirm.
+      log.error(`tx did not confirm within ${CONFIRMATION_TIMEOUT_MS}ms, cancelling nonce`, { txHash: tx.hash, nonce: tx.nonce });
+      db.recordAttempt({
+        network: NETWORK_LABEL,
+        adapter1,
+        adapter2,
+        amount: amount.toString(),
+        quotedNetProfit: netProfit.toString(),
+        outcome: 'failed_timeout',
+        txHash: tx.hash,
+        errorMessage: `did not confirm within ${CONFIRMATION_TIMEOUT_MS}ms`,
+      });
+      await tripCircuitBreakerIfNeeded();
       await cancelStuckTransaction(tx.nonce);
     } else {
+      db.recordAttempt({
+        network: NETWORK_LABEL,
+        adapter1,
+        adapter2,
+        amount: amount.toString(),
+        quotedNetProfit: netProfit.toString(),
+        outcome: 'failed_timeout',
+        txHash: tx.hash,
+        errorMessage: err.message,
+      });
       throw err;
     }
   }
@@ -280,7 +503,7 @@ async function cancelStuckTransaction(nonce) {
   // loudly here rather than crash on BigInt * null below, which would
   // exit one-shot mode with the nonce still stuck and no explanation.
   if (feeData.maxFeePerGas == null || feeData.maxPriorityFeePerGas == null) {
-    console.error(`cannot build cancellation for nonce ${nonce}: endpoint returned no EIP-1559 fee data -- manual intervention required`);
+    log.error(`cannot build cancellation for nonce ${nonce}: endpoint returned no EIP-1559 fee data -- manual intervention required`);
     return;
   }
   const cancelTx = await submitWallet.sendTransaction({
@@ -293,7 +516,7 @@ async function cancelStuckTransaction(nonce) {
     maxFeePerGas: (feeData.maxFeePerGas * 150n) / 100n,
     maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas * 150n) / 100n,
   });
-  console.log('cancellation tx sent:', cancelTx.hash);
+  log.info('cancellation tx sent', { txHash: cancelTx.hash });
   // Bounded, same as the original tx's wait in tryRoute() -- without a
   // timeout here, a cancellation that itself never confirms (e.g. a
   // private relay that won't broadcast a bare self-transfer) blocks this
@@ -303,9 +526,9 @@ async function cancelStuckTransaction(nonce) {
   // prevent, just moved one level up.
   try {
     await cancelTx.wait(1, CONFIRMATION_TIMEOUT_MS);
-    console.log(`nonce ${nonce} freed`);
+    log.info(`nonce ${nonce} freed`);
   } catch {
-    console.error(`cancellation for nonce ${nonce} also did not confirm within ${CONFIRMATION_TIMEOUT_MS}ms -- manual intervention required`);
+    log.error(`cancellation for nonce ${nonce} also did not confirm within ${CONFIRMATION_TIMEOUT_MS}ms -- manual intervention required`);
   }
 }
 
@@ -419,7 +642,7 @@ async function resolveCurveCandidates(curveAdapters, borrowedAsset, provider, { 
     } else if (coin1.toLowerCase() === borrowedLower) {
       [otherToken, iOut, jOut] = [coin0, 1, 0];
     } else {
-      console.log(`curve adapter ${address}: pool trades ${coin0}/${coin1}, doesn't include BORROWED_ASSET -- skipping`);
+      log.info(`curve adapter ${address}: pool trades ${coin0}/${coin1}, doesn't include BORROWED_ASSET -- skipping`);
       continue;
     }
 
@@ -505,7 +728,7 @@ async function prefilterCandidates(candidates, config) {
   if ((!v3FactoryAddress && !v2FactoryAddress) || candidates.length <= prefilterTopN) {
     return candidates;
   }
-  console.log(`pre-filtering ${candidates.length} candidate(s) down to the top ${prefilterTopN} by local reserve math before quoting...`);
+  log.info(`pre-filtering ${candidates.length} candidate(s) down to the top ${prefilterTopN} by local reserve math before quoting...`);
 
   const uniqueHops = new Map();
   for (const c of candidates) {
@@ -623,7 +846,7 @@ async function loadScanConfig() {
   const curveAdapters = parsedAdapters.filter((a) => a.protocol === 'curve');
   const balancerAdapters = parsedAdapters.filter((a) => a.protocol === 'balancer');
   if (balancerAdapters.length > 0) {
-    console.log(
+    log.info(
       `${balancerAdapters.length} balancer adapter(s) configured but not yet scanned -- poolId isn't derivable on-chain the way Curve's coin indices are; see the comment above buildCandidates() for how to wire one in once a real pool is verified live.`
     );
   }
@@ -655,17 +878,17 @@ async function loadScanConfig() {
 /** One full scan-and-try pass. Called once directly, or repeatedly in WATCH_MODE. */
 async function scanOnce(config) {
   const candidates = await buildCandidates(config);
-  console.log(`scanning ${candidates.length} candidate route(s)...`);
+  log.info(`scanning ${candidates.length} candidate route(s)...`);
 
   const ranked = await rankCandidates(candidates, config.concurrency);
-  console.log(`${ranked.length} candidate(s) returned a quote (the rest had no pool at that fee tier, or reverted)`);
+  log.info(`${ranked.length} candidate(s) returned a quote (the rest had no pool at that fee tier, or reverted)`);
   if (ranked.length === 0) {
-    console.log('no viable routes found this pass');
+    log.info('no viable routes found this pass');
     return;
   }
 
   const best = ranked[0];
-  console.log(`best candidate net profit: ${ethers.formatUnits(best.netProfit, config.decimals)}`);
+  log.info(`best candidate net profit: ${ethers.formatUnits(best.netProfit, config.decimals)}`);
 
   // tryRoute() re-quotes internally before submitting -- intentional, not
   // duplicate work: it's a fresh state check immediately before spending
@@ -678,24 +901,24 @@ async function main() {
 
   const config = await loadScanConfig();
   if (!config) {
-    console.log('Set ADAPTERS, BORROWED_ASSET, and VIA_TOKENS in .env to scan for routes -- see .env.example.');
+    log.info('Set ADAPTERS, BORROWED_ASSET, and VIA_TOKENS in .env to scan for routes -- see .env.example.');
     return;
   }
 
   if (process.env.WATCH_MODE === 'true') {
-    console.log('watch mode: scanning on every new block (Ctrl+C to stop)...');
+    log.info('watch mode: scanning on every new block (Ctrl+C to stop)...');
     let scanning = false;
     provider.on('block', async (blockNumber) => {
       if (scanning) {
-        console.log(`block ${blockNumber}: previous scan still running, skipping this block`);
+        log.info(`block ${blockNumber}: previous scan still running, skipping this block`);
         return;
       }
       scanning = true;
       try {
-        console.log(`--- block ${blockNumber} ---`);
+        log.info(`--- block ${blockNumber} ---`);
         await scanOnce(config);
       } catch (err) {
-        console.error('scan error (continuing to watch):', err);
+        log.error('scan error (continuing to watch)', { error: String(err) });
       } finally {
         scanning = false;
       }
