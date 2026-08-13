@@ -281,6 +281,75 @@ function applyHopPrice(hop, price, amountIn) {
   return (amountInWithFee * reserveOut) / (reserveIn * 1000n + amountInWithFee);
 }
 
+/**
+ * Chains applyHopPrice() across every hop in a candidate's route (the
+ * same per-hop loop prefilterCandidates() runs in index.js, factored out
+ * so the trade sizer below can reuse it) -- pure computation, no RPC.
+ * Returns null the moment any hop can't be priced (e.g. zero liquidity),
+ * same as applyHopPrice() itself.
+ */
+function applyHopChain(hops, priceCache, amountIn) {
+  let amount = amountIn;
+  for (const hop of hops) {
+    const price = priceCache.get(hopKey(hop));
+    if (!price) return null;
+    amount = applyHopPrice(hop, price, amount);
+    if (amount === null) return null;
+  }
+  return amount;
+}
+
+/**
+ * Finds the amountIn (within [minAmount, maxAmount]) that maximizes
+ * round-trip net profit (applyHopChain(amount) - amount) for a given
+ * route, via ternary search rather than a closed-form per-protocol
+ * formula -- works identically for a pure-V2, pure-V3, or mixed chain,
+ * reusing applyHopChain()/applyHopPrice() exactly as-is.
+ *
+ * Ternary search finds the maximum of a *unimodal* (single-peaked)
+ * function without needing its derivative. That's the one assumption
+ * this makes: round-trip profit across a chain of AMM swaps is concave
+ * in the input amount -- each individual swap's output is a concave
+ * function of its input (diminishing returns from price impact, true
+ * for both the exact V2 formula and the V3 swap-step math above), and
+ * composing concave functions this way preserves that shape closely
+ * enough in practice for ternary search to reliably find the peak (see
+ * lib.test.js: cross-checked against a fine-grained brute-force scan,
+ * not just trusted from the math alone).
+ *
+ * Only cares about amount-dependent profitability -- gas cost, Aave's
+ * flash-loan premium, and the contract's own maxLoanAmount cap are
+ * deliberately NOT applied here; those are the caller's job afterward
+ * (tryRoute() already enforces maxLoanAmount, and a gas-aware comparison
+ * needs a live fee-data call this pure function can't make). This finds
+ * the size that maximizes *gross* round-trip output over input, nothing
+ * more.
+ *
+ * Returns null if the chain can't be priced at all (checked once
+ * upfront at minAmount -- a hop's liquidity being zero doesn't depend on
+ * the amount being tried, so there's no need to re-check on every search
+ * step), or if the best size found still isn't profitable.
+ */
+function findOptimalTradeSize(hops, priceCache, minAmount, maxAmount, iterations = 64) {
+  if (applyHopChain(hops, priceCache, minAmount) === null) return null;
+
+  const profitAt = (amount) => applyHopChain(hops, priceCache, amount) - amount;
+
+  let lo = minAmount;
+  let hi = maxAmount;
+  for (let i = 0; i < iterations && hi - lo > 1n; i++) {
+    const third = (hi - lo) / 3n;
+    const m1 = lo + third;
+    const m2 = hi - third;
+    if (profitAt(m1) < profitAt(m2)) lo = m1;
+    else hi = m2;
+  }
+
+  const bestAmount = lo + (hi - lo) / 2n;
+  const bestProfit = profitAt(bestAmount);
+  return bestProfit > 0n ? { amount: bestAmount, profit: bestProfit } : null;
+}
+
 module.exports = {
   KNOWN_PROTOCOLS,
   GENERIC_PROTOCOLS,
@@ -300,4 +369,6 @@ module.exports = {
   Q96,
   v3SwapAmountOut,
   applyHopPrice,
+  applyHopChain,
+  findOptimalTradeSize,
 };

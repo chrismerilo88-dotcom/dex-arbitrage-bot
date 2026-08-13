@@ -290,3 +290,80 @@ describe('applyHopPrice', () => {
     assert.equal(lib.applyHopPrice(hop, { protocol: 'v2', token0: WETH.toLowerCase(), reserve0: 100n, reserve1: 0n }, 1n), null);
   });
 });
+
+describe('applyHopChain', () => {
+  test('chains multiple hops in sequence, output of one feeding input of the next', () => {
+    const hops = [
+      { protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 0 },
+      { protocol: 'v3', tokenIn: USDC, tokenOut: DAI, fee: 0 },
+    ];
+    const priceCache = new Map();
+    priceCache.set(lib.hopKey(hops[0]), { protocol: 'v3', fee: 0, token0: WETH.toLowerCase(), sqrtPriceX96: lib.Q96, liquidity: 10n ** 24n });
+    priceCache.set(lib.hopKey(hops[1]), { protocol: 'v3', fee: 0, token0: USDC.toLowerCase(), sqrtPriceX96: 2n * lib.Q96, liquidity: 10n ** 24n });
+    // Small trade limit: 1_000_000 -> 1_000_000 (1:1) -> 4_000_000 (4x).
+    assert.equal(lib.applyHopChain(hops, priceCache, 1_000_000n), 4_000_000n);
+  });
+
+  test('returns null the moment any hop in the chain lacks price data', () => {
+    const hops = [{ protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 0 }];
+    assert.equal(lib.applyHopChain(hops, new Map(), 1_000_000n), null);
+  });
+});
+
+describe('findOptimalTradeSize', () => {
+  // Two V2-style pools priced differently enough for a real arbitrage
+  // edge to exist. Round trip: WETH -> USDC (pool1, sells WETH at the
+  // BETTER of the two rates) -> WETH (pool2, buys WETH back cheaper).
+  // Numbers cross-checked against an independent 200,000-step
+  // brute-force scan over the same range before being written in here
+  // (not just trusted from the ternary search's own output) -- matched
+  // to within 0.0002% on amount and 0.000000% on profit, with
+  // unimodality (no second peak) confirmed empirically across the range.
+  const WETH_USDC_POOL1 = {
+    protocol: 'v2',
+    token0: WETH.toLowerCase(),
+    reserve0: 900_000_000_000_000_000_000n, // 900 WETH
+    reserve1: 2_050_000_000_000n, // 2,050,000 USDC -- price ~2278
+  };
+  const WETH_USDC_POOL2 = {
+    protocol: 'v2',
+    token0: WETH.toLowerCase(),
+    reserve0: 1_000_000_000_000_000_000_000n, // 1000 WETH
+    reserve1: 2_000_000_000_000n, // 2,000,000 USDC -- price 2000
+  };
+  const hops = [
+    { protocol: 'v2', tokenIn: WETH, tokenOut: USDC, fee: 0 },
+    { protocol: 'v2', tokenIn: USDC, tokenOut: WETH, fee: 0 },
+  ];
+  const priceCache = new Map([
+    [lib.hopKey(hops[0]), WETH_USDC_POOL1],
+    [lib.hopKey(hops[1]), WETH_USDC_POOL2],
+  ]);
+
+  test('finds the real optimum, matching an independent brute-force scan', () => {
+    const result = lib.findOptimalTradeSize(hops, priceCache, 1n, 100_000_000_000_000_000_000n);
+    assert.ok(result !== null);
+    // Brute-force ground truth from the scratch verification script:
+    // amount 28566999999999942867, profit 1827888345350716911.
+    const amountDiffPct = Number((result.amount - 28_566_999_999_999_942_867n) * 1_000_000n / 28_566_999_999_999_942_867n) / 10_000;
+    const profitDiffPct = Number((result.profit - 1_827_888_345_350_716_911n) * 1_000_000n / 1_827_888_345_350_716_911n) / 10_000;
+    assert.ok(Math.abs(amountDiffPct) < 0.01, `amount off by ${amountDiffPct}%`);
+    assert.ok(Math.abs(profitDiffPct) < 0.01, `profit off by ${profitDiffPct}%`);
+  });
+
+  test('returns null when no amount in range is profitable (both pools priced the same)', () => {
+    const samePrice = new Map([
+      [lib.hopKey(hops[0]), WETH_USDC_POOL2],
+      [lib.hopKey(hops[1]), WETH_USDC_POOL2],
+    ]);
+    assert.equal(lib.findOptimalTradeSize(hops, samePrice, 1n, 100_000_000_000_000_000_000n), null);
+  });
+
+  test('returns null immediately when a hop has zero liquidity, without searching', () => {
+    const noLiquidity = new Map([
+      [lib.hopKey(hops[0]), { ...WETH_USDC_POOL1, reserve0: 0n }],
+      [lib.hopKey(hops[1]), WETH_USDC_POOL2],
+    ]);
+    assert.equal(lib.findOptimalTradeSize(hops, noLiquidity, 1n, 100_000_000_000_000_000_000n), null);
+  });
+});

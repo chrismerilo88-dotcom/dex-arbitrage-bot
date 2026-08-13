@@ -14,9 +14,12 @@
  * candidates that reach a full quoteRoute() simulation using the pool's
  * actual liquidity depth (v3SwapAmountOut() in lib.js), not just spot
  * price, but it still can't see a trade that would cross into the next
- * initialized tick, and even in WATCH_MODE it reacts to confirmed
- * blocks, not pending mempool transactions. See the "Opportunity
- * discovery" section comment for exactly what's covered.
+ * initialized tick. The survivors also get sized: findOptimalTradeSize()
+ * in lib.js finds each one's locally-best amount instead of always
+ * testing one fixed SCAN_AMOUNT, via ternary search over the same price
+ * data (no extra RPC calls). And even in WATCH_MODE it reacts to
+ * confirmed blocks, not pending mempool transactions. See the
+ * "Opportunity discovery" section comment for exactly what's covered.
  *
  * Usage:
  *   npm install
@@ -46,7 +49,8 @@ const {
   buildTwoLegCandidates,
   buildTriangularCandidates,
   hopKey,
-  applyHopPrice,
+  applyHopChain,
+  findOptimalTradeSize,
 } = require('./lib');
 const db = require('../shared/db');
 const { createLogger } = require('../shared/logger');
@@ -755,6 +759,11 @@ async function resolveHopPrice(protocol, tokenIn, tokenOut, fee, factoryAddress)
  * configured, or when there aren't more candidates than prefilterTopN
  * already -- so leaving V3_FACTORY_ADDRESS/V2_FACTORY_ADDRESS unset keeps
  * today's exact behavior, no breaking change.
+ *
+ * The survivors then go through sizeTradesUsingCache() (see its own doc
+ * comment) before returning -- tests every candidate at the amount that
+ * (locally) maximizes its output, not just the fixed SCAN_AMOUNT,
+ * reusing this same priceCache at zero extra RPC cost.
  */
 async function prefilterCandidates(candidates, config) {
   const { v3FactoryAddress, v2FactoryAddress, prefilterTopN, concurrency } = config;
@@ -784,17 +793,8 @@ async function prefilterCandidates(candidates, config) {
   }
 
   const scored = candidates.map((c) => {
-    let amount = c.amount;
-    for (const hop of c._hops) {
-      const price = priceCache.get(hopKey(hop));
-      if (!price) {
-        amount = null;
-        break;
-      }
-      amount = applyHopPrice(hop, price, amount);
-      if (amount === null) break;
-    }
-    return { ...c, _roughProfit: amount === null ? null : amount - c.amount };
+    const out = applyHopChain(c._hops, priceCache, c.amount);
+    return { ...c, _roughProfit: out === null ? null : out - c.amount };
   });
 
   // Candidates whose hops couldn't be priced at all (no pool at that fee
@@ -809,7 +809,38 @@ async function prefilterCandidates(candidates, config) {
     return b._roughProfit > a._roughProfit ? 1 : b._roughProfit < a._roughProfit ? -1 : 0;
   });
 
-  return scored.slice(0, prefilterTopN);
+  const top = scored.slice(0, prefilterTopN);
+  return sizeTradesUsingCache(top, priceCache, config);
+}
+
+/**
+ * Trade sizer: for each of the pre-filter's surviving candidates, finds
+ * the amountIn that maximizes gross round-trip output using the exact
+ * same priceCache the pre-filter just built -- zero additional RPC
+ * calls, since the liquidity data is already in hand. Replaces
+ * candidate.amount with the optimized size wherever findOptimalTradeSize()
+ * finds one; leaves candidate.amount untouched (the configured
+ * SCAN_AMOUNT) for anything it can't size (no price data, or nothing
+ * profitable found in [TRADE_SIZER_MIN_AMOUNT, TRADE_SIZER_MAX_AMOUNT]).
+ *
+ * Deliberately NOT bounded by the contract's maxLoanAmount -- that's
+ * enforced downstream in tryRoute() regardless of what amount this
+ * suggests (and correctly still blocks a real submission that exceeds
+ * it). Bounding the search by maxLoanAmount here would make sizing
+ * useless during DRY_RUN specifically, where maxLoanAmount is
+ * deliberately kept at 0 -- the entire point is finding what WOULD be
+ * optimal if the cap were unlocked, not what fits under today's cap.
+ */
+function sizeTradesUsingCache(candidates, priceCache, config) {
+  const { tradeSizerMinAmount, tradeSizerMaxAmount } = config;
+  return candidates.map((c) => {
+    const sized = findOptimalTradeSize(c._hops, priceCache, tradeSizerMinAmount, tradeSizerMaxAmount);
+    if (!sized) return c;
+    log.info(
+      `trade sizer: adjusted amount ${ethers.formatUnits(c.amount, config.decimals)} -> ${ethers.formatUnits(sized.amount, config.decimals)} (rough optimized profit ${ethers.formatUnits(sized.profit, config.decimals)})`
+    );
+    return { ...c, amount: sized.amount };
+  });
 }
 
 async function buildCandidates(config) {
@@ -885,6 +916,7 @@ async function loadScanConfig() {
   }
 
   const [decimals, wethAddress] = await Promise.all([resolveDecimals(borrowedAsset), bot.WETH()]);
+  const amount = ethers.parseUnits(process.env.SCAN_AMOUNT || '1', decimals);
 
   return {
     genericAdapters,
@@ -894,7 +926,7 @@ async function loadScanConfig() {
     decimals,
     viaTokens,
     feeTiers: parseFeeTiers(process.env.FEE_TIERS),
-    amount: ethers.parseUnits(process.env.SCAN_AMOUNT || '1', decimals),
+    amount,
     minProfit: ethers.parseUnits(process.env.MIN_PROFIT || '0.01', decimals),
     slippageBps: Number(process.env.SLIPPAGE_BPS || 300),
     concurrency: Number(process.env.SCAN_CONCURRENCY || 20),
@@ -905,6 +937,17 @@ async function loadScanConfig() {
     v3FactoryAddress: process.env.V3_FACTORY_ADDRESS || null,
     v2FactoryAddress: process.env.V2_FACTORY_ADDRESS || null,
     prefilterTopN: Number(process.env.PREFILTER_TOP_N || 25),
+    // Trade sizer (see sizeTradesUsingCache() above) -- only takes effect
+    // when the pre-filter itself is enabled, since it reuses that same
+    // price cache. Defaults to a wide range around SCAN_AMOUNT (1% to
+    // 1000x) rather than a fixed absolute number, so it scales
+    // sensibly whatever units/token this is configured for.
+    tradeSizerMinAmount: process.env.TRADE_SIZER_MIN_AMOUNT
+      ? ethers.parseUnits(process.env.TRADE_SIZER_MIN_AMOUNT, decimals)
+      : amount / 100n || 1n,
+    tradeSizerMaxAmount: process.env.TRADE_SIZER_MAX_AMOUNT
+      ? ethers.parseUnits(process.env.TRADE_SIZER_MAX_AMOUNT, decimals)
+      : amount * 1000n,
   };
 }
 
