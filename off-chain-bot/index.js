@@ -743,34 +743,39 @@ async function resolveHopPrice(protocol, tokenIn, tokenOut, fee, factoryAddress)
 }
 
 /**
- * Cheap local ranking pass before the expensive, authoritative
+ * Cheap local ranking + sizing pass before the expensive, authoritative
  * quoteRoute() check: fetches ONE price per unique hop across the whole
  * candidate set (not one per candidate -- the same via-token/fee hop
  * shows up in many candidates, e.g. every adapter-pair variant routing
  * through the same via-token at the same fee tier), chains those prices
- * to estimate each candidate's round-trip output, and keeps only the top
- * prefilterTopN. This is a RANKING signal only -- see applyHopPrice()'s
- * doc comment for why it can rank a real winner below a candidate that
- * later reverts or quotes worse. rankCandidates() still runs the real
- * quoteRoute() on whatever this returns, and still decides everything
- * about submission.
+ * to estimate each candidate's round-trip output, keeps only the top
+ * prefilterTopN when there are actually more than that to trim, and
+ * then runs every survivor through sizeTradesUsingCache() (see its own
+ * doc comment) -- testing each one at the amount that locally maximizes
+ * its output, not just the fixed SCAN_AMOUNT, reusing this same
+ * priceCache at zero extra RPC cost. This is a RANKING/SIZING signal
+ * only -- see applyHopPrice()'s doc comment for why it can rank a real
+ * winner below a candidate that later reverts or quotes worse.
+ * rankCandidates() still runs the real quoteRoute() on whatever this
+ * returns, and still decides everything about submission.
  *
- * A no-op (returns candidates unchanged) when neither factory address is
- * configured, or when there aren't more candidates than prefilterTopN
- * already -- so leaving V3_FACTORY_ADDRESS/V2_FACTORY_ADDRESS unset keeps
- * today's exact behavior, no breaking change.
- *
- * The survivors then go through sizeTradesUsingCache() (see its own doc
- * comment) before returning -- tests every candidate at the amount that
- * (locally) maximizes its output, not just the fixed SCAN_AMOUNT,
- * reusing this same priceCache at zero extra RPC cost.
+ * A no-op (returns candidates unchanged) only when NEITHER factory
+ * address is configured -- so leaving V3_FACTORY_ADDRESS/
+ * V2_FACTORY_ADDRESS unset keeps today's exact behavior, no breaking
+ * change. Trimming and sizing are otherwise independent: even with a
+ * small candidate set that doesn't need trimming (fewer than
+ * prefilterTopN), sizing still runs -- the two were coupled in an
+ * earlier version of this function (sizing lived behind the same "more
+ * candidates than prefilterTopN" early return as trimming), which
+ * silently meant sizing never engaged at all for anything with a small
+ * candidate count, caught while wiring up a real deployment with fewer
+ * candidates than the default PREFILTER_TOP_N.
  */
 async function prefilterCandidates(candidates, config) {
   const { v3FactoryAddress, v2FactoryAddress, prefilterTopN, concurrency } = config;
-  if ((!v3FactoryAddress && !v2FactoryAddress) || candidates.length <= prefilterTopN) {
+  if (!v3FactoryAddress && !v2FactoryAddress) {
     return candidates;
   }
-  log.info(`pre-filtering ${candidates.length} candidate(s) down to the top ${prefilterTopN} by local reserve math before quoting...`);
 
   const uniqueHops = new Map();
   for (const c of candidates) {
@@ -792,24 +797,31 @@ async function prefilterCandidates(candidates, config) {
     );
   }
 
-  const scored = candidates.map((c) => {
-    const out = applyHopChain(c._hops, priceCache, c.amount);
-    return { ...c, _roughProfit: out === null ? null : out - c.amount };
-  });
+  let top = candidates;
+  if (candidates.length > prefilterTopN) {
+    log.info(`pre-filtering ${candidates.length} candidate(s) down to the top ${prefilterTopN} by local reserve math before quoting...`);
 
-  // Candidates whose hops couldn't be priced at all (no pool at that fee
-  // tier, or a protocol this pre-filter doesn't cover) can't be ranked --
-  // cluster them at the bottom instead of dropping them outright, so a
-  // real-but-unpriced route still gets a shot at the top N when there's
-  // room, same as it always could before this pre-filter existed.
-  scored.sort((a, b) => {
-    if (a._roughProfit === null && b._roughProfit === null) return 0;
-    if (a._roughProfit === null) return 1;
-    if (b._roughProfit === null) return -1;
-    return b._roughProfit > a._roughProfit ? 1 : b._roughProfit < a._roughProfit ? -1 : 0;
-  });
+    const scored = candidates.map((c) => {
+      const out = applyHopChain(c._hops, priceCache, c.amount);
+      return { ...c, _roughProfit: out === null ? null : out - c.amount };
+    });
 
-  const top = scored.slice(0, prefilterTopN);
+    // Candidates whose hops couldn't be priced at all (no pool at that
+    // fee tier, or a protocol this pre-filter doesn't cover) can't be
+    // ranked -- cluster them at the bottom instead of dropping them
+    // outright, so a real-but-unpriced route still gets a shot at the
+    // top N when there's room, same as it always could before this
+    // pre-filter existed.
+    scored.sort((a, b) => {
+      if (a._roughProfit === null && b._roughProfit === null) return 0;
+      if (a._roughProfit === null) return 1;
+      if (b._roughProfit === null) return -1;
+      return b._roughProfit > a._roughProfit ? 1 : b._roughProfit < a._roughProfit ? -1 : 0;
+    });
+
+    top = scored.slice(0, prefilterTopN);
+  }
+
   return sizeTradesUsingCache(top, priceCache, config);
 }
 
