@@ -1,0 +1,13 @@
+{
+  "name": "dex-arbitrage-bot-monitor",
+  "version": "0.1.0",
+  "description": "Watches DexArbitrageBotFlashLoan's admin-state events (approvals, ownership, operator, cap changes) across every configured network, in real time. See notes/06 - Pre-Mainnet Checklist.md, item 4.",
+  "main": "monitor.js",
+  "scripts": {
+    "start": "node monitor.js"
+  },
+  "dependencies": {
+    "ethers": "6.17.0",
+    "dotenv": "16.6.1"
+  }
+}
