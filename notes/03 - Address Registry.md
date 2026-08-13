@@ -255,7 +255,7 @@ Fixed by generating a fresh, dedicated key (`0x0E7de81E4823c69f8c0930b66f7185135
 
 **Foundry/revm caveat, logged so it's not re-discovered from scratch**: `forge script`/`forge test --fork-url` against Base Sepolia fail with `EvmError: NotActivated` on any call into the Aave PoolAddressesProvider (`0xE4C2...4Ad00`) -- specifically its `getPool()` call reverts locally in revm at ~65 gas, while the identical call succeeds via a direct `cast call` against the real RPC (confirmed repeatedly). This affects `forge test`, `forge script` (simulated), and even `forge script --skip-simulation` (which still executes the script once locally to build the transaction list, so it hits the same wall). Tried `--evm-version` across shanghai/cancun/prague/london/paris -- no difference. Root cause is presumed to be forge 1.7.1's revm lagging some very recent Base/OP-stack chain upgrade; not yet fixed via `foundryup` (deliberately deferred, not required to unblock deployment). **Workaround used for this deployment**: bypass `forge script` entirely -- get creation bytecode via `forge inspect <Contract> bytecode`, append `cast abi-encode "constructor(...)" ...` for constructor args, and broadcast with `cast send --create`, which does no local simulation at all. See [[04 - Deployment Runbook]] for the exact commands if this needs to be repeated.
 
-## 🔄 BNB Chain — verified viable, contract work done, not yet deployed
+## ✅ BNB Chain Mainnet — verified live, deployed (DRY_RUN only)
 
 Checked after Ethereum mainnet's WETH/USDC confirmed fully arbitraged and Arbitrum was already in progress -- asked "what else." Both prerequisites confirmed live:
 
@@ -281,7 +281,18 @@ Checked after Ethereum mainnet's WETH/USDC confirmed fully arbitraged and Arbitr
 
 Fixed with a new `contracts/adapters/PancakeV3Adapter.sol`, otherwise identical to `UniswapV3Adapter.sol` but targeting the original `ISwapRouter` shape. Verified before writing it: independently recomputed both selectors via `cast sig` from the interface's own struct shape and confirmed an exact match against the real router's live bytecode, not assumed from "PancakeSwap is a Uniswap V3 fork." QuoterV2's selectors, by contrast, were separately checked and do match Uniswap's shape -- only the router needed a new interface. Compiles clean, 32/32 fork-free unit tests still pass.
 
-**Not yet deployed** -- contract-side work is done and verified; deployment is a real-money decision (a fresh deployer key + funding, same pattern as Ethereum Mainnet and Arbitrum Mainnet) that hasn't been made yet.
+### Deployed contract instances (BNB Chain Mainnet)
+
+| Contract | Address | Notes |
+|---|---|---|
+| `DexArbitrageBotFlashLoan` (executor) | `0xEea58C6F3C0708c658c6d4Db98d789B1Bedc6F8C` | v14, live. Single-key owned by a fresh deployer key generated specifically for this network (`0x4041AE6c57e9F0453c6531bdA87178e3543254B9`), funded with ~0.015 BNB real money (all gas). **`maxLoanAmount` is deliberately, permanently 0**, same reasoning as every other DRY_RUN-only mainnet deployment |
+| `PancakeV3Adapter` | `0xb36F2fF64f2Fc6Cf3008a7846181492b4C61Bf3A` | First live use of this new adapter. `ROUTER()`/`QUOTER()` confirmed live post-deploy, matching the addresses above |
+
+Adapter and WBNB/USDT approved, `approvalDelay` 0, `maxLoanAmount` confirmed 0 post-setup. PancakeSwap V3 only for now (single protocol, 16 candidates) -- same phased approach as Ethereum Mainnet before Arbitrum's cross-DEX expansion; if this comes back fully arbitraged too, the next step is a second BNB Chain DEX (BiSwap, ApeSwap, or PancakeSwap's own V2), not more of the same protocol.
+
+**Real, live bug caught during setup, not deployment**: at the default `SCAN_CONCURRENCY=10`, 0/16 candidates returned a quote at all against the free public RPC (`bsc-dataseed1.binance.org`) -- confirmed via a manual `cast call quoteRoute()` that the contract/adapter were fine, so the failure was purely RPC-side. At `SCAN_CONCURRENCY=1`, all 16/16 quoted successfully. The free public endpoint silently fails/rate-limits under concurrent `eth_call` load in a way `rankCandidates()`'s bare `catch` can't distinguish from "no pool here" -- `.env.bnb-mainnet` runs at concurrency 1 accordingly. A paid/dedicated BSC RPC would likely tolerate more, but hasn't been set up for this network.
+
+Off-chain scanner runs persistently via systemd (`off-chain-bot/dex-arbitrage-scanner-bnb-mainnet.service`, same pattern as the other two mainnet scanners), `WATCH_MODE=true`, `DRY_RUN=true`. `node shared/report.js` (filter by "BNB Chain Mainnet") tracks progress here too.
 
 ## 🔄 Curve / Balancer — investigated, blocked, not verified
 
