@@ -93,16 +93,43 @@ Adapter and both tokens (Aave's WETH + USDC) approved; `approvalDelay` set to 0 
 
 **Funding note**: getting real ETH onto this network took two failed attempts before succeeding -- a faucet requiring a mainnet balance first (anti-abuse measure, blocked this testnet-only wallet), and a bridge transaction that was filled out but never actually confirmed/signed (wallet Activity tab stayed empty, balance unchanged). Third attempt -- properly confirming the Sepolia-to-Arbitrum-Sepolia bridge transaction -- worked, landing 0.02 ETH.
 
-## ✅ Ethereum Mainnet — verified, not yet deployed against
+## ✅ Ethereum Mainnet — verified live, deployed (DRY_RUN only)
 
-| Contract | Address |
-|---|---|
-| WETH | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` |
-| Aave PoolAddressesProvider | `0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e` |
-| Uniswap V2 Router02 | `0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D` |
-| Uniswap V3 SwapRouter02 | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` |
-| Uniswap V3 QuoterV2 | `0x61fFE014bA17989E743c5F6cB21bF9697530B21e` |
-| Balancer Vault | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` |
+| Contract | Address | Verified via |
+|---|---|---|
+| WETH | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` | `cast code` + `name()`/`symbol()` self-identification ("Wrapped Ether"/"WETH") |
+| Aave PoolAddressesProvider | `0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e` | `cast code` + `getPool()` resolves to a real, live Pool contract |
+| Uniswap V2 Router02 | `0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D` | `cast code` (not currently used by any deployed adapter -- v3-only so far on this network) |
+| Uniswap V3 SwapRouter02 | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` | `cast code` + self-consistent `factory()` |
+| Uniswap V3 QuoterV2 | `0x61fFE014bA17989E743c5F6cB21bF9697530B21e` | `cast code` |
+| Uniswap V3 Factory | `0x1F98431c8aD98523631AE4a59f267346ea31F984` | Queried directly from the confirmed-good SwapRouter02's own `factory()` -- self-consistent ground truth, same method as every other network |
+| USDC | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` | `cast code` + `name()`/`symbol()`/`decimals()` self-identification ("USD Coin"/"USDC"/6) |
+| Balancer Vault | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` | `cast code` (not currently used -- no adapter deployed for it on this network) |
+
+**WETH/USDC pool liquidity check**, all three fee tiers, same method as every other network:
+
+| Fee tier | Pool address | Liquidity |
+|---|---|---|
+| 500 (0.05%) | `0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640` | `8796513570041565008` -- deepest of the three, real market depth |
+| 3000 (0.3%) | `0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8` | `621917942391651938` |
+| 10000 (1%) | `0x7BeA39867e4169DBe237d55C8242a8f2fcDcc387` | `13387167328646483` |
+
+All orders of magnitude deeper than anything seen on any testnet in this file -- expected, this is where real market depth actually lives.
+
+### Deployed contract instances (Ethereum Mainnet)
+
+| Contract | Address | Notes |
+|---|---|---|
+| `DexArbitrageBotFlashLoan` (executor) | `0x03e22682AA1e319E55598B89A3366083b2d28051` | v14, live. Single-key owned (deployer = a fresh key generated specifically for this, `0xD692484B3263dFb3c18fBaA545a4fcff38DFaB32`, funded with 0.005 ETH real money -- the only real-money spend so far, all gas). **`maxLoanAmount` is deliberately, permanently 0** -- see [[06 - Pre-Mainnet Checklist]]'s pre-funding bar. Deployed at a real gas price of ~0.075 Gwei (~$0.0002-0.0003 ETH total for deployment + adapter + approvals -- confirmed unusually cheap at deploy time, verified against the block's own `baseFeePerGas` directly, not just `cast gas-price`, since it looked implausibly low at first) |
+| `UniswapV3Adapter` | `0x7400889e29Dd8E3a9667050571F2c87feDfa7450` | Wired to the confirmed SwapRouter02 + QuoterV2 above. `ROUTER()`/`QUOTER()` confirmed live post-deploy |
+
+Adapter and WETH/USDC approved, `approvalDelay` 0. **`maxLoanAmount` intentionally never called** -- this deployment exists solely to let `off-chain-bot/` run `DRY_RUN=true` against real mainnet liquidity, observing whether genuine arbitrage opportunities exist, without any ability to execute a real trade regardless of what the off-chain code does. See [[06 - Pre-Mainnet Checklist]] for the exact milestone this is measuring toward.
+
+**Two real bugs found only by actually running this against mainnet, not by writing/reviewing the code**:
+1. `assertSubmissionSetupIsSafe()`'s mainnet `SUBMIT_RPC_URL` requirement blocked `DRY_RUN` mode entirely -- it exists to stop a *real* submission leaking to the public mempool, but `DRY_RUN` never submits anything at all, so the check was protecting against something structurally impossible in that mode. Fixed: skipped when `DRY_RUN=true`.
+2. `maxLoanAmount = 0` (deliberately, permanently, for exactly the reason above) meant `tryRoute()` bailed out on its very first check, before ever reaching the real `quoteRoute()`/gas-estimate logic that `DRY_RUN` exists to run -- every attempt was recording `skipped_cap` with zero profitability data, silently defeating the entire deployment's purpose. Fixed: the `amount > maxLoanAmount` check is now skipped specifically when `DRY_RUN=true` (real submissions still enforce it unconditionally).
+
+Off-chain scanner runs persistently via systemd (`off-chain-bot/dex-arbitrage-scanner-mainnet.service`, same pattern as `monitoring/`'s service), `WATCH_MODE=true`, reacting to every new mainnet block. Progress toward the 100-opportunity milestone: `node shared/report.js` (reads `shared/data/bot.db`, the same DB `off-chain-bot/` and `monitoring/` share).
 
 ## ✅ Base Sepolia — confirmed live
 

@@ -171,6 +171,8 @@ const CONFIRMATION_TIMEOUT_MS = Number(process.env.CONFIRMATION_TIMEOUT_MS || 12
 /// fall back to the public mempool with no warning), and catches
 /// RPC_URL/SUBMIT_RPC_URL pointing at two different chains (which would
 /// sign a transaction against the wrong network's EXECUTOR_ADDRESS).
+/// Skipped entirely when DRY_RUN=true -- nothing gets submitted in that
+/// mode, so there's no mempool-leak risk to protect against.
 // Hosts known to actually be private submission paths -- see
 // SUBMIT_RPC_URL's comment in .env.example. Extend this list rather than
 // relying on ALLOW_UNKNOWN_SUBMIT_RELAY for anything you use regularly.
@@ -185,6 +187,13 @@ async function assertSubmissionSetupIsSafe() {
     );
   }
   if (!MAINNET_CHAIN_IDS.has(readNet.chainId)) return;
+  // DRY_RUN never calls requestFlashLoanArbitrage at all (see tryRoute()'s
+  // submission block) -- there's no real transaction to leak to the
+  // public mempool, so the private-relay requirement below exists to
+  // protect something that structurally can't happen in this mode.
+  // Requiring it anyway would just block dry-run observation on mainnet
+  // for no safety benefit.
+  if (DRY_RUN) return;
 
   // On mainnet, "SUBMIT_RPC_URL is set" isn't enough -- someone hitting a
   // confusing error at 2am could satisfy this by pointing it at the same
@@ -282,7 +291,18 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
     db.recordAttempt({ network: NETWORK_LABEL, adapter1, adapter2, amount: amount.toString(), outcome: 'skipped_adapter_not_approved' });
     return;
   }
-  if (amount > cap) {
+  // Skipped in DRY_RUN mode: maxLoanAmount is a hard cap on what a REAL
+  // submission is allowed to move, and dry-run deployments deliberately
+  // keep it at 0 specifically so nothing can ever execute for real (see
+  // .env.mainnet's own comment on this). Enforcing it here too would
+  // mean tryRoute() always bails out on this exact check before ever
+  // reaching its own quoteRoute()/gas-estimate logic -- the entire point
+  // of dry-run is seeing what WOULD happen if the cap were actually
+  // unlocked, without unlocking it. Caught by actually running this
+  // against mainnet: every attempt was silently recording skipped_cap
+  // with zero profitability data, which would have defeated the whole
+  // deployment's purpose.
+  if (!DRY_RUN && amount > cap) {
     log.info(`amount ${amount} exceeds maxLoanAmount ${cap}, skipping`);
     db.recordAttempt({ network: NETWORK_LABEL, adapter1, adapter2, amount: amount.toString(), outcome: 'skipped_cap' });
     return;
