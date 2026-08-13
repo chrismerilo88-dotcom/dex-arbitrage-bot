@@ -1,0 +1,26 @@
+# Template of the unit actually installed on this project's dev machine
+# -- paths below (ExecStart, WorkingDirectory) are specific to that
+# machine and need adjusting on any other. To install elsewhere:
+#   cp monitoring/dex-arbitrage-monitor.service ~/.config/systemd/user/
+#   # edit the two paths above for the new machine
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now dex-arbitrage-monitor.service
+#   loginctl enable-linger $USER   # keeps it running without an active login session
+# Check on it: systemctl --user status dex-arbitrage-monitor.service
+# Logs: journalctl --user -u dex-arbitrage-monitor.service -f
+[Unit]
+Description=DexArbitrageBotFlashLoan admin-event monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/chrismerilo88/dex-arbitrage-bot/monitoring
+ExecStart=/home/chrismerilo88/.nvm/versions/node/v24.19.0/bin/node monitor.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
