@@ -11,11 +11,12 @@
  *
  * This is a real, working scanner, but not a production one -- local
  * reserve math (see prefilterCandidates() below) cuts the number of
- * candidates that reach a full quoteRoute() simulation, but it's a
- * spot-price approximation, not concentrated-liquidity-aware, and even
- * in WATCH_MODE it reacts to confirmed blocks, not pending mempool
- * transactions. See the "Opportunity discovery" section comment for
- * exactly what's covered.
+ * candidates that reach a full quoteRoute() simulation using the pool's
+ * actual liquidity depth (v3SwapAmountOut() in lib.js), not just spot
+ * price, but it still can't see a trade that would cross into the next
+ * initialized tick, and even in WATCH_MODE it reacts to confirmed
+ * blocks, not pending mempool transactions. See the "Opportunity
+ * discovery" section comment for exactly what's covered.
  *
  * Usage:
  *   npm install
@@ -59,10 +60,11 @@ const CURVE_POOL_ABI = ['function coins(uint256 index) view returns (address)'];
 
 // Minimal read-only ABIs for the local reserve-math pre-filter (see
 // prefilterCandidates() below) -- just enough to read a pool's current
-// spot price without simulating a swap.
+// price and liquidity depth without simulating a swap.
 const V3_FACTORY_ABI = ['function getPool(address tokenA, address tokenB, uint24 fee) view returns (address)'];
 const V3_POOL_ABI = [
   'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  'function liquidity() view returns (uint128)',
   'function token0() view returns (address)',
 ];
 const V2_FACTORY_ABI = ['function getPair(address tokenA, address tokenB) view returns (address)'];
@@ -373,18 +375,22 @@ async function cancelStuckTransaction(nonce) {
 // grows combinatorially with how many adapters/via-tokens/fee-tiers you
 // configure. Two things now cap what that growth actually costs:
 //   - prefilterCandidates() (optional -- set V3_FACTORY_ADDRESS and/or
-//     V2_FACTORY_ADDRESS to enable) reads one cheap spot-price per unique
-//     hop (slot0()/getReserves(), not a swap simulation) and keeps only
-//     the top PREFILTER_TOP_N candidates by rough estimated profit.
+//     V2_FACTORY_ADDRESS to enable) reads one cheap price snapshot per
+//     unique hop (slot0()+liquidity(), or getReserves() -- two/one
+//     storage reads, not a swap simulation) and keeps only the top
+//     PREFILTER_TOP_N candidates by rough estimated profit, computed via
+//     v3SwapAmountOut()/applyHopPrice() in lib.js using that pool's real
+//     liquidity depth, not just its spot price.
 //   - rankCandidates() below still quotes whatever survives that (or
 //     everything, if the pre-filter is off) via the real, authoritative
 //     quoteRoute(), batched via SCAN_CONCURRENCY to avoid hammering the
 //     RPC provider.
 // The pre-filter is a ranking approximation, not a substitute for
-// quoteRoute() -- see prefilterCandidates()'s own doc comment for exactly
-// what it ignores (concentrated-liquidity depth, tick-crossing). Keep the
-// adapter/via-token list deliberately scoped to what's actually approved
-// and worth checking either way, not "everything you can think of."
+// quoteRoute() -- see v3SwapAmountOut()'s doc comment in lib.js for
+// exactly what it still can't see (a trade large enough to cross into
+// the next initialized tick). Keep the adapter/via-token list
+// deliberately scoped to what's actually approved and worth checking
+// either way, not "everything you can think of."
 // ---------------------------------------------------------------------
 
 /**
@@ -453,10 +459,13 @@ async function resolvePoolAddress(protocol, tokenA, tokenB, fee, factoryAddress)
 }
 
 /**
- * Fetches one hop's current price, cheaply -- slot0() for v3 (a single
- * storage read) or getReserves() for v2 -- instead of the full swap
- * simulation quoteRoute()/QuoterV2 does. Returns null when there's no
- * pool at all for this (protocol, tokenIn, tokenOut, fee) combination.
+ * Fetches one hop's current price, cheaply -- slot0() + liquidity() for
+ * v3 (two storage reads) or getReserves() for v2 -- instead of the full
+ * swap simulation quoteRoute()/QuoterV2 does. liquidity() is what lets
+ * applyHopPrice()'s v3 math account for real price impact instead of
+ * just spot price -- see v3SwapAmountOut()'s doc comment in lib.js for
+ * exactly what that does and doesn't capture. Returns null when there's
+ * no pool at all for this (protocol, tokenIn, tokenOut, fee) combination.
  */
 async function resolveHopPrice(protocol, tokenIn, tokenOut, fee, factoryAddress) {
   const poolAddress = await resolvePoolAddress(protocol, tokenIn, tokenOut, fee, factoryAddress);
@@ -464,8 +473,8 @@ async function resolveHopPrice(protocol, tokenIn, tokenOut, fee, factoryAddress)
 
   if (protocol === 'v3') {
     const pool = new ethers.Contract(poolAddress, V3_POOL_ABI, provider);
-    const [slot0, token0] = await Promise.all([pool.slot0(), pool.token0()]);
-    return { protocol, fee, token0: token0.toLowerCase(), sqrtPriceX96: slot0.sqrtPriceX96 };
+    const [slot0, liquidity, token0] = await Promise.all([pool.slot0(), pool.liquidity(), pool.token0()]);
+    return { protocol, fee, token0: token0.toLowerCase(), sqrtPriceX96: slot0.sqrtPriceX96, liquidity };
   }
 
   const pair = new ethers.Contract(poolAddress, V2_PAIR_ABI, provider);

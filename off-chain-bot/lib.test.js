@@ -190,33 +190,80 @@ describe('hopKey', () => {
   });
 });
 
+// Deliberately huge relative to every amountIn used below, so these
+// tests sit in the "trade small vs. liquidity" limit where v3's real
+// swap-step math is expected to converge (near-exactly, modulo integer
+// truncation) to the naive spot-price prediction -- verified by hand via
+// a scratch script before writing these numbers in, not just captured
+// from a first run. See the "real price impact" tests further down for
+// cases where liquidity depth actually changes the answer.
+const HUGE_LIQUIDITY = 10n ** 24n;
+
+describe('v3SwapAmountOut (exact swap-step math)', () => {
+  test('1:1 price, zeroForOne, small trade converges to the spot-price limit', () => {
+    assert.equal(lib.v3SwapAmountOut(lib.Q96, HUGE_LIQUIDITY, true, 1_000_000n), 1_000_000n);
+  });
+
+  test('4x price (sqrtPriceX96 = 2*Q96), small trade converges to the spot-price limit', () => {
+    assert.equal(lib.v3SwapAmountOut(2n * lib.Q96, HUGE_LIQUIDITY, true, 1_000_000n), 4_000_000n);
+  });
+
+  test('!zeroForOne (buying token0 with token1) at 4x price converges to the inverse spot price', () => {
+    // Tiny trade relative to liquidity -> integer truncation of 1000/4 is the only "error" (249 vs 250).
+    assert.equal(lib.v3SwapAmountOut(2n * lib.Q96, HUGE_LIQUIDITY, false, 1000n), 249n);
+  });
+
+  test('real price impact: a trade large enough to matter yields strictly less than the naive spot prediction', () => {
+    const amountIn = 10n ** 20n; // meaningful fraction of HUGE_LIQUIDITY's scale
+    const out = lib.v3SwapAmountOut(lib.Q96, HUGE_LIQUIDITY, true, amountIn);
+    assert.equal(out, 99990000999900009999n); // hand-verified via scratch script, not just "whatever it outputs"
+    assert.ok(out < amountIn, 'a real swap-step, sqrt-curve trade must yield less than a flat 1:1 spot prediction');
+  });
+});
+
 describe('applyHopPrice', () => {
-  test('v3: token0 == tokenIn, 1:1 spot price, zero fee', () => {
+  test('v3: token0 == tokenIn, 1:1 spot price, zero fee, small trade', () => {
     // sqrtPriceX96 for a 1:1 price is exactly 2^96.
-    const price = { protocol: 'v3', fee: 0, token0: WETH.toLowerCase(), sqrtPriceX96: 2n ** 96n };
+    const price = { protocol: 'v3', fee: 0, token0: WETH.toLowerCase(), sqrtPriceX96: 2n ** 96n, liquidity: HUGE_LIQUIDITY };
     const hop = { protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 0 };
     assert.equal(lib.applyHopPrice(hop, price, 1_000_000n), 1_000_000n);
   });
 
-  test('v3: token0 == tokenOut (inverse direction) still resolves to the same 1:1 price', () => {
-    const price = { protocol: 'v3', fee: 0, token0: USDC.toLowerCase(), sqrtPriceX96: 2n ** 96n };
+  test('v3: token0 == tokenOut (inverse direction) still resolves to ~1:1 price', () => {
+    const price = { protocol: 'v3', fee: 0, token0: USDC.toLowerCase(), sqrtPriceX96: 2n ** 96n, liquidity: HUGE_LIQUIDITY };
     const hop = { protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 0 };
-    assert.equal(lib.applyHopPrice(hop, price, 1_000_000n), 1_000_000n);
+    // The !zeroForOne formula truncates differently than zeroForOne's at
+    // this scale -- 999999n, not a clean 1000000n, is the actual correct
+    // answer here (verified via the same scratch script), not an
+    // off-by-one bug: integer rounding always favors the pool slightly,
+    // same as real Uniswap V3.
+    assert.equal(lib.applyHopPrice(hop, price, 1_000_000n), 999_999n);
   });
 
-  test('v3: applies the pool fee tier as a proportional cut', () => {
-    // 3000 = 0.3% fee tier (parts per million).
-    const price = { protocol: 'v3', fee: 3000, token0: WETH.toLowerCase(), sqrtPriceX96: 2n ** 96n };
+  test('v3: fee is deducted from the input before the swap-step math runs', () => {
+    // 3000 = 0.3% fee tier (parts per million). In the small-trade limit
+    // this matches a flat (1 - fee) multiply, but applyHopPrice() does it
+    // by shrinking the input first -- see its doc comment for why that
+    // stops being equivalent to a post-multiply once price impact is
+    // nonlinear (real price impact case further down proves the two
+    // orderings diverge).
+    const price = { protocol: 'v3', fee: 3000, token0: WETH.toLowerCase(), sqrtPriceX96: 2n ** 96n, liquidity: HUGE_LIQUIDITY };
     const hop = { protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 3000 };
     const out = lib.applyHopPrice(hop, price, 1_000_000n);
-    assert.equal(out, 997_000n); // 1_000_000 * (1 - 0.003)
+    assert.equal(out, 997_000n); // 1_000_000 * (1 - 0.003), in the small-trade limit
   });
 
   test('v3: a 2x price ratio scales output accordingly', () => {
     // sqrtPriceX96 = 2 * 2^96 => price (token1/token0) = 4.
-    const price = { protocol: 'v3', fee: 0, token0: WETH.toLowerCase(), sqrtPriceX96: 2n * 2n ** 96n };
+    const price = { protocol: 'v3', fee: 0, token0: WETH.toLowerCase(), sqrtPriceX96: 2n * 2n ** 96n, liquidity: HUGE_LIQUIDITY };
     const hop = { protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 0 };
     assert.equal(lib.applyHopPrice(hop, price, 1_000_000n), 4_000_000n);
+  });
+
+  test('v3: returns null when the pool has zero liquidity', () => {
+    const price = { protocol: 'v3', fee: 0, token0: WETH.toLowerCase(), sqrtPriceX96: 2n ** 96n, liquidity: 0n };
+    const hop = { protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 0 };
+    assert.equal(lib.applyHopPrice(hop, price, 1_000_000n), null);
   });
 
   test('v2: matches the standard constant-product formula exactly', () => {

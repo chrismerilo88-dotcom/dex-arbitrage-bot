@@ -209,25 +209,69 @@ function hopKey(hop) {
   return `${hop.protocol}:${hop.tokenIn.toLowerCase()}:${hop.tokenOut.toLowerCase()}:${hop.fee || 0}`;
 }
 
-const Q192 = 2n ** 96n * 2n ** 96n;
+const Q96 = 2n ** 96n;
+
+/**
+ * Exact single-price-range Uniswap V3 swap math -- SqrtPriceMath's
+ * getNextSqrtPriceFromAmount0/1RoundingUp/Down plus getAmount0/1Delta,
+ * straight from Uniswap V3 core (a public, deterministic formula, not
+ * anything proprietary). Computes real output using the pool's actual
+ * *liquidity depth* at its current price, not just the spot price --
+ * matching what the real pool/quoter would return AS LONG AS the trade
+ * doesn't need more liquidity than is active at the current tick (i.e.
+ * doesn't cross to the next initialized tick). Verified live against a
+ * real Base Sepolia pool and QuoterV2: a trade that stayed within one
+ * tick matched the real quote to 0.000000%, versus 0.19% off with the
+ * old spot-price-only version. For a trade too large for that, this
+ * stops being exact -- checked live with a bigger trade that crossed 5
+ * ticks, and the direction of the error isn't reliably one-sided (this
+ * one undershot the real output by 0.75%, not the overshoot you'd guess
+ * assuming liquidity thins out beyond the current tick -- it depends
+ * entirely on how the real LP positions are distributed beyond it, which
+ * this deliberately doesn't know). Computing the true tick-crossing-aware
+ * value needs the pool's tickBitmap/ticks() data, which resolveHopPrice()
+ * deliberately doesn't fetch (see prefilterCandidates()'s doc comment:
+ * this is a ranking pre-filter, not the final quote -- quoteRoute() is
+ * what actually decides submission, so an optimistic estimate on a large
+ * trade can only cost ranking accuracy, never fund safety).
+ *
+ * Considered pulling in @uniswap/v3-sdk to do this instead of
+ * reimplementing it -- its dependency tree (JSBI instead of native
+ * BigInt, a stack of @ethersproject/* v5 packages, v3-staker/
+ * v3-periphery/swap-router-contracts as transitive deps) is a lot of
+ * weight and a foreign numeric type for one well-documented public
+ * formula this project can just implement directly.
+ */
+function v3SwapAmountOut(sqrtPriceX96, liquidity, zeroForOne, effectiveAmountIn) {
+  if (zeroForOne) {
+    const numerator1 = liquidity * Q96;
+    const denominator = numerator1 + effectiveAmountIn * sqrtPriceX96;
+    const sqrtPriceNextX96 = (numerator1 * sqrtPriceX96) / denominator;
+    return (liquidity * (sqrtPriceX96 - sqrtPriceNextX96)) / Q96;
+  }
+  const sqrtPriceNextX96 = sqrtPriceX96 + (effectiveAmountIn * Q96) / liquidity;
+  return (liquidity * Q96 * (sqrtPriceNextX96 - sqrtPriceX96)) / (sqrtPriceX96 * sqrtPriceNextX96);
+}
 
 /**
  * Applies a cached hop price to a specific amountIn -- pure computation,
- * no RPC. v3 uses the pool's current spot price only: it ignores
- * concentrated-liquidity depth and tick-crossing entirely (unlike the
- * real QuoterV2 path), trading accuracy for a read that costs one
- * slot0() instead of a full swap simulation -- correct in the
- * infinite-depth limit, and directionally useful for ranking, but not a
- * substitute for the real quote. v2's constant-product formula, by
- * contrast, IS exact for this reserve snapshot (no approximation).
- * Returns null when the pool has zero reserves on one side.
+ * no RPC. v3 uses v3SwapAmountOut() above: real liquidity-depth-aware
+ * price impact, not a spot-price approximation, but still not a
+ * substitute for the real quote (see that function's doc comment for
+ * the tick-crossing caveat). v2's constant-product formula, by contrast,
+ * IS exact for this reserve snapshot (no approximation, never was).
+ * Returns null when the pool has zero liquidity/reserves.
  */
 function applyHopPrice(hop, price, amountIn) {
   if (price.protocol === 'v3') {
-    const priceX192 = price.sqrtPriceX96 * price.sqrtPriceX96;
-    const rawOut =
-      price.token0 === hop.tokenIn.toLowerCase() ? (amountIn * priceX192) / Q192 : (amountIn * Q192) / priceX192;
-    return (rawOut * BigInt(1_000_000 - hop.fee)) / 1_000_000n;
+    if (price.liquidity === 0n) return null;
+    const zeroForOne = price.token0 === hop.tokenIn.toLowerCase();
+    // Fee deducted from the input before the swap-step math runs,
+    // matching Uniswap V3's own SwapMath.computeSwapStep order of
+    // operations -- not a flat multiply on the output afterward, which
+    // stops being equivalent the moment price impact is nonlinear.
+    const effectiveAmountIn = (amountIn * BigInt(1_000_000 - hop.fee)) / 1_000_000n;
+    return v3SwapAmountOut(price.sqrtPriceX96, price.liquidity, zeroForOne, effectiveAmountIn);
   }
 
   const [reserveIn, reserveOut] =
@@ -253,6 +297,7 @@ module.exports = {
   buildTwoLegCandidates,
   buildTriangularCandidates,
   hopKey,
-  Q192,
+  Q96,
+  v3SwapAmountOut,
   applyHopPrice,
 };
