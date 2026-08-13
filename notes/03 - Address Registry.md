@@ -255,6 +255,34 @@ Fixed by generating a fresh, dedicated key (`0x0E7de81E4823c69f8c0930b66f7185135
 
 **Foundry/revm caveat, logged so it's not re-discovered from scratch**: `forge script`/`forge test --fork-url` against Base Sepolia fail with `EvmError: NotActivated` on any call into the Aave PoolAddressesProvider (`0xE4C2...4Ad00`) -- specifically its `getPool()` call reverts locally in revm at ~65 gas, while the identical call succeeds via a direct `cast call` against the real RPC (confirmed repeatedly). This affects `forge test`, `forge script` (simulated), and even `forge script --skip-simulation` (which still executes the script once locally to build the transaction list, so it hits the same wall). Tried `--evm-version` across shanghai/cancun/prague/london/paris -- no difference. Root cause is presumed to be forge 1.7.1's revm lagging some very recent Base/OP-stack chain upgrade; not yet fixed via `foundryup` (deliberately deferred, not required to unblock deployment). **Workaround used for this deployment**: bypass `forge script` entirely -- get creation bytecode via `forge inspect <Contract> bytecode`, append `cast abi-encode "constructor(...)" ...` for constructor args, and broadcast with `cast send --create`, which does no local simulation at all. See [[04 - Deployment Runbook]] for the exact commands if this needs to be repeated.
 
+## 🔄 BNB Chain — verified viable, contract work done, not yet deployed
+
+Checked after Ethereum mainnet's WETH/USDC confirmed fully arbitraged and Arbitrum was already in progress -- asked "what else." Both prerequisites confirmed live:
+
+| Contract | Address | Verified via |
+|---|---|---|
+| Aave PoolAddressesProvider | `0xff75B6da14FfbbfD355Daf7a2731456b3562Ba6D` | Official `aave-address-book` (`AaveV3BNB.sol`) + `cast code` + `getPool()` resolves to a real, live Pool contract |
+| WBNB | `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c` | Official `aave-address-book`'s `WBNB_UNDERLYING` + `cast code` + `symbol()` self-identification |
+| USDT | `0x55d398326f99059fF775485246999027B3197955` | Official `aave-address-book`'s `USDT_UNDERLYING` + `cast code` + `symbol()`/`decimals()` self-identification ("USDT"/18 -- note 18 decimals, not USDT's usual 6, since this is BNB Chain's own bridged/native deployment) |
+| PancakeSwap V3 Factory | `0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865` | Official `pancake-v3-contracts` GitHub repo's own `deployments/bscMainnet.json` + `cast code`, cross-confirmed independently via a second source (the `@pancakeswap/v3-sdk` npm package's bundled constants) before trusting it |
+| PancakeSwap V3 QuoterV2 | `0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997` | Same source + `cast code` + `cast selectors` against live bytecode confirms `quoteExactInputSingle`/`quoteExactInput` selectors match Uniswap's QuoterV2 shape exactly |
+| PancakeSwap V3 SwapRouter | `0x1b81D678ffb9C0263b24A97847620C99d213eB14` | Same source + `cast code`. **Does NOT match Uniswap SwapRouter02's interface** -- see below |
+
+**Real liquidity confirmed**, WBNB/USDT across all four of PancakeSwap's fee tiers (100/500/2500/10000 -- different from Uniswap's 500/3000/10000):
+
+| Fee tier | Pool address | Liquidity |
+|---|---|---|
+| 100 (0.01%) | `0x172fcD41E0913e95784454622d1c3724f546f849` | `6312567662236941418074908` -- deepest by far |
+| 500 (0.05%) | `0x36696169C63e42cd08ce11f5deeBbCeBae652050` | `1883574879993795241208613` |
+| 2500 (0.25%) | `0x1401ff943D08a7E098328C1d3a9d388923B115D2` | `16691348847140023560818` |
+| 10000 (1%) | `0x6805E0E5333c5c3acCF2930Be4734E2b98f4Ce06` | `1344953231590004411922` |
+
+**Router interface mismatch found, same category of bug this project already caught once for Uniswap SwapRouter02**: PancakeSwap's real SwapRouter uses selectors `0x414bf389`/`0xc04b8d59`, confirmed via `cast selectors` against its live bytecode -- the *original* v3-periphery `ISwapRouter` interface (deadline in the structs), not SwapRouter02's `IV3SwapRouter` that `UniswapV3Adapter.sol` targets and every other network in this file actually deploys. PancakeSwap never adopted SwapRouter02's interface. Deploying the existing adapter against it would have reverted on every real swap -- caught before deploying anything, not after.
+
+Fixed with a new `contracts/adapters/PancakeV3Adapter.sol`, otherwise identical to `UniswapV3Adapter.sol` but targeting the original `ISwapRouter` shape. Verified before writing it: independently recomputed both selectors via `cast sig` from the interface's own struct shape and confirmed an exact match against the real router's live bytecode, not assumed from "PancakeSwap is a Uniswap V3 fork." QuoterV2's selectors, by contrast, were separately checked and do match Uniswap's shape -- only the router needed a new interface. Compiles clean, 32/32 fork-free unit tests still pass.
+
+**Not yet deployed** -- contract-side work is done and verified; deployment is a real-money decision (a fresh deployer key + funding, same pattern as Ethereum Mainnet and Arbitrum Mainnet) that hasn't been made yet.
+
 ## 🔄 Curve / Balancer — investigated, blocked, not verified
 
 The off-chain bot already has working infrastructure for both protocols (protocol-tagged `ADAPTERS` config, correct route encoding for each, and for Curve specifically, on-chain auto-discovery of a pool's traded pair via `coins()` -- see `off-chain-bot/index.js`). Neither has an actual verified pool to point that infrastructure at yet.
