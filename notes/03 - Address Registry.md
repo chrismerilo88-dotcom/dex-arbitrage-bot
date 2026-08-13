@@ -131,6 +131,44 @@ Adapter and WETH/USDC approved, `approvalDelay` 0. **`maxLoanAmount` intentional
 
 Off-chain scanner runs persistently via systemd (`off-chain-bot/dex-arbitrage-scanner-mainnet.service`, same pattern as `monitoring/`'s service), `WATCH_MODE=true`, reacting to every new mainnet block. Progress toward the 100-opportunity milestone: `node shared/report.js` (reads `shared/data/bot.db`, the same DB `off-chain-bot/` and `monitoring/` share).
 
+**Update**: after real trade sizing (see below) confirmed no profitable size exists anywhere from 0.01-1000 WETH across all 9 fee-tier combinations on this pair, checked directly rather than just inferred from zero dry-run hits -- Ethereum mainnet's WETH/USDC is one of the single most heavily arbitraged pairs in all of crypto, and scanning one protocol against its own fee tiers doesn't create genuine price divergence when the same searchers correct all of those tiers together. See the Arbitrum Mainnet section below for the pivot this led to.
+
+## ✅ Arbitrum Mainnet — verified live, deployed (DRY_RUN only, cross-DEX)
+
+Deployed as a second DRY_RUN observer specifically to test genuine cross-DEX price divergence (Uniswap V3 vs. SushiSwap V2 on the same pair) rather than repeating Ethereum mainnet's same-protocol-different-fee-tier scanning, which turned out to already be fully arbitraged.
+
+| Contract | Address | Verified via |
+|---|---|---|
+| WETH | `0x82aF49447D8a07e3bd95BD0d56f35241523fBab1` | Official `aave-address-book` (`AaveV3Arbitrum.sol`) + `cast code`. Independently cross-checked: SushiSwap's router `WETH()` call returns this exact same address |
+| Aave PoolAddressesProvider | `0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb` | Official `aave-address-book` + `cast code` + `getPool()` resolves to a real, live Pool contract |
+| USDC (native, not USDC.e) | `0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8` | Official `aave-address-book`'s `USDC_UNDERLYING` + `cast code` + `name()`/`symbol()`/`decimals()` self-identification ("USD Coin (Arb1)"/"USDC"/6) |
+| Uniswap V3 SwapRouter02 | `0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45` | **Same address as Ethereum mainnet** -- Uniswap's real deterministic cross-chain deployment (confirmed, not a research-summary mixup like the ones logged in the wrong-addresses table below -- verified live on the actual Arbitrum RPC, self-consistent `factory()`, not just accepted because it matched a known address) |
+| Uniswap V3 QuoterV2 | `0x61fFE014bA17989E743c5F6cB21bF9697530B21e` | Same address as Ethereum mainnet, same live-verification treatment |
+| Uniswap V3 Factory | `0x1F98431c8aD98523631AE4a59f267346ea31F984` | Same address as Ethereum mainnet, self-consistent via the router's own `factory()` |
+| SushiSwap Factory (V2-style) | `0xc35DADB65012eC5796536bD9864eD8773aBc74C4` | `cast code` + self-consistent via the router's own `factory()` call |
+| SushiSwap Router02 (V2-style) | `0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506` | `cast code` + its own `WETH()` call matches Aave's WETH exactly (see above) |
+
+**Real liquidity confirmed on both DEXs before deploying anything**:
+
+| Venue | Pool/pair | Liquidity |
+|---|---|---|
+| Uniswap V3, 500 (0.05%) | `0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443` | `33651878359847033` |
+| Uniswap V3, 3000 (0.3%) | `0x17c14D2c404D167802b16C450d3c99F88F2c4F4d` | `13020943601521651` |
+| Uniswap V3, 10000 (1%) | `0x7e5E4a3F855f19cC1a45b9eFF1c8B2419036CE85` | `83388783585344` |
+| SushiSwap V2 pair | `0x905dfCD5649217c42684f23958568e533C711Aa3` | `40.01 WETH / 75,168 USDC` reserves -- token0 confirmed as WETH |
+
+### Deployed contract instances (Arbitrum Mainnet)
+
+| Contract | Address | Notes |
+|---|---|---|
+| `DexArbitrageBotFlashLoan` (executor) | `0x03e22682AA1e319E55598B89A3366083b2d28051` | v14, live. **Same address string as the Ethereum Mainnet executor above -- different networks, coincidental nonce collision (same deployer, same fresh-chain nonce sequence), not the same contract.** Single-key owned by the same deployer key used for Ethereum mainnet (`0xD692484B3263dFb3c18fBaA545a4fcff38DFaB32`) -- separately funded with 0.005 ETH real money on Arbitrum specifically, since L2 balances are entirely independent of L1 balances even for the same address. **`maxLoanAmount` is deliberately, permanently 0**, same reasoning as Ethereum mainnet |
+| `UniswapV3Adapter` | `0x7400889e29Dd8E3a9667050571F2c87feDfa7450` | Wired to the confirmed SwapRouter02 + QuoterV2 above. `ROUTER()`/`QUOTER()` confirmed live post-deploy |
+| `UniswapV2Adapter` | `0x3C0be090cad892f2027576CcACCdA7C851324C5E` | New -- first live use of this adapter in the project. Wired to SushiSwap's confirmed Router02. `ROUTER()` confirmed live post-deploy |
+
+Both adapters and WETH/USDC approved, `approvalDelay` 0, `maxLoanAmount` confirmed 0 post-setup. Off-chain scanner runs persistently via systemd (`off-chain-bot/dex-arbitrage-scanner-arbitrum-mainnet.service`), `WATCH_MODE=true`, `DRY_RUN=true`. With two protocols configured, candidate count is 16 (up from Ethereum mainnet's 9) -- includes genuine cross-DEX candidates (a Uniswap V3 leg paired with a SushiSwap V2 leg), not just same-protocol fee-tier variants. Same `node shared/report.js` (filter by "Arbitrum Mainnet") tracks progress here too.
+
+**Funding note**: getting ETH onto this deployer address (on Arbitrum specifically, separate from its existing Ethereum mainnet balance) needed care -- an early attempt via a MetaMask-embedded buy widget defaulted to buying ARB (Arbitrum's governance token, an ERC-20) instead of ETH, and separately defaulted the destination network back to Ethereum Mainnet after switching the asset. Both caught before completing the purchase. Landed correctly after explicitly re-selecting ETH as the asset and Arbitrum Mainnet as the network, then a manual send from the user's own wallet to the deployer address.
+
 ## ✅ Base Sepolia — confirmed live
 
 | Contract | Address | Verified via |
