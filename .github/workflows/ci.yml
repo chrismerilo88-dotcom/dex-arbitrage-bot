@@ -8,7 +8,7 @@ on:
 
 jobs:
   contracts:
-    name: Foundry (build + unit tests)
+    name: Foundry (build + tests + Slither)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,14 +20,24 @@ jobs:
       - name: Build
         run: forge build
 
-      - name: Unit tests
-        # DexArbitrageBotFlashLoanUnit.t.sol is the pure suite -- no
-        # --fork-url needed (see its own doc comment). BaseSepoliaSmokeTest
-        # and DeploySmokeTest require a real, rate-limited RPC endpoint
-        # (BASE_SEPOLIA_RPC_URL / MAINNET_RPC_URL) and hit live testnet/
-        # mainnet state -- deliberately left out of CI, run manually per
-        # their own doc comments instead.
-        run: forge test --match-contract DexArbitrageBotFlashLoanUnit -vvv
+      - name: Unit + fuzz tests
+        # Excludes BaseSepoliaSmokeTest / DeploySmokeTest specifically --
+        # both need a real, rate-limited RPC endpoint (BASE_SEPOLIA_RPC_URL
+        # / MAINNET_RPC_URL) and hit live testnet/mainnet state, so they
+        # stay a manual step per their own doc comments. Everything else
+        # (the pure unit suite plus the mocked profit-floor fuzz test) is
+        # fully self-contained and runs here on every push.
+        run: forge test --no-match-contract "BaseSepoliaSmokeTest|DeploySmokeTest" -vvv
+
+      - name: Slither (informational -- see notes/02 - Security Review Log.md)
+        # Reports findings without failing the build: all 45 current
+        # findings have been individually triaged (see the security log)
+        # and none are real bugs, so failing on them would just be
+        # permanently-red noise. Re-triage manually if this list grows.
+        run: |
+          python3 -m venv /tmp/slither-venv
+          /tmp/slither-venv/bin/pip install -q slither-analyzer
+          /tmp/slither-venv/bin/slither . --foundry-out-directory out --fail-none
 
   off-chain-bot:
     name: off-chain-bot (node --test)
