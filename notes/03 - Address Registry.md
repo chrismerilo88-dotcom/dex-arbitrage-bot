@@ -133,6 +133,20 @@ Off-chain scanner runs persistently via systemd (`off-chain-bot/dex-arbitrage-sc
 
 **Update**: after real trade sizing (see below) confirmed no profitable size exists anywhere from 0.01-1000 WETH across all 9 fee-tier combinations on this pair, checked directly rather than just inferred from zero dry-run hits -- Ethereum mainnet's WETH/USDC is one of the single most heavily arbitraged pairs in all of crypto, and scanning one protocol against its own fee tiers doesn't create genuine price divergence when the same searchers correct all of those tiers together. See the Arbitrum Mainnet section below for the pivot this led to.
 
+### Curve cross-DEX candidate added (2026-08-14)
+
+Same underlying reasoning as Arbitrum's SushiSwap and BNB Chain's BiSwap additions -- one protocol scanning its own fee tiers doesn't create genuine divergence, so pair against a genuinely different protocol instead. Design: `docs/superpowers/specs/2026-08-13-curve-cross-dex-candidates-design.md`; implementation plan: `docs/superpowers/plans/2026-08-13-curve-cross-dex-candidates.md`.
+
+Curve's real, live-verified 3pool: `0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7` -- `coins(0)=DAI` (`0x6B175474E89094C44Da98b954EedeAC495271d0F`), `coins(1)=USDC` (`0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48`), `coins(2)=USDT` (`0xdAC17F958D2ee523a2206206994597C13D831ec7`). `CurveAdapter.sol` requires exactly 2 tokens per leg (no round trip through a single pool -- that combination can never be profitable), so `buildCurveCrossCandidates()` in `off-chain-bot/lib.js` instead pairs the Curve leg (`borrowed <-> USDC-anchor`) against the existing generic v3 adapter, in both directions.
+
+| Contract | Address | Notes |
+|---|---|---|
+| `CurveAdapter` | `0x2D85506697b762ec970197D8DD173C42A3BF70D3` | Deployed via the established `cast send --create` workaround. `POOL()` confirmed live matching the real 3pool address above |
+
+`BORROWED_ASSET` changed from WETH to USDC (USDC was already the `VIA_TOKENS` entry; WETH moved into `VIA_TOKENS` in its place) -- keeps the existing WETH<->USDC Uniswap V3 scanning surface, just re-rooted at USDC so the Curve leg (DAI/USDC/USDT) has a shared anchor to pair against. `ADAPTERS` gained the Curve adapter above; DAI and USDT approved as new tokens (USDC was already approved). All three approvals (adapter, DAI, USDT) and `maxLoanAmount` (confirmed still `0`) verified live post-transaction, `approvalDelay` reconfirmed `0` so no cooldown wait was needed.
+
+Scanner restarted and verified live: candidate count went from 9 to 15 (the new Curve-vs-v3 pairings), and all 15 returned real quotes -- confirms the Curve legs are producing genuine callable routes, not silently reverting.
+
 ## ✅ Arbitrum Mainnet — verified live, deployed (DRY_RUN only, cross-DEX)
 
 Deployed as a second DRY_RUN observer specifically to test genuine cross-DEX price divergence (Uniswap V3 vs. SushiSwap V2 on the same pair) rather than repeating Ethereum mainnet's same-protocol-different-fee-tier scanning, which turned out to already be fully arbitraged.
