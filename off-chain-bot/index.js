@@ -50,6 +50,7 @@ const {
   buildTriangularCandidates,
   buildCurveCrossCandidates,
   hopKey,
+  applyHopPrice,
   applyHopChain,
   findOptimalTradeSize,
 } = require('./lib');
@@ -277,7 +278,7 @@ async function tripCircuitBreakerIfNeeded() {
  * This is the part every scanner calls once it *thinks* it found
  * something -- it does not itself decide what to check.
  */
-async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, minProfit, slippageBps }, decimals, isBorrowedAssetWeth) {
+async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, minProfit, slippageBps }, decimals, isBorrowedAssetWeth, gasConversion) {
   if (isCircuitBreakerHalted()) {
     const state = db.getCircuitBreakerState();
     log.warn(`circuit breaker is halted (${state.haltedReason}), skipping this candidate entirely`);
@@ -343,58 +344,70 @@ async function tryRoute({ amount, adapter1, routeData1, adapter2, routeData2, mi
   // denominated in ETH/wei, which is only directly comparable to
   // netProfit (in borrowed-asset units) when the borrowed asset IS WETH
   // -- matching the on-chain gas backstop's own restriction, see item 21
-  // in the contract's header. For any other borrowed asset there's no
-  // price conversion here (that would need an oracle), so the gas
-  // adjustment is skipped entirely rather than silently mixing units --
-  // minProfit alone is what gates those trades, same as the on-chain
-  // backstop's own documented limitation.
+  // in the contract's header. For any other borrowed asset, gasConversion
+  // (see loadScanConfig()) supplies a live WETH->borrowedAsset v3 price to
+  // convert gasCostWei instead; if that's unavailable (no v3 factory
+  // configured, or WETH isn't a via-token), the adjustment falls back to
+  // minProfit alone, same as the on-chain backstop's own documented
+  // limitation -- but that fallback is now an explicit, logged case
+  // rather than the only path for every non-WETH borrow.
+  //
+  // estimateGas always runs first, regardless of borrowed asset -- it
+  // simulates the real call, and if the trade would actually revert on
+  // execution (most commonly InsufficientReturn(), a real quote-to-
+  // execution gap; see the contract's own doc comment on that error),
+  // this throws here, before anything is sent. That's the whole safety
+  // mechanism working as intended -- but previously it only ran when
+  // isBorrowedAssetWeth was true, so a non-WETH borrow's candidates never
+  // got this revert check at all, and crashed the whole process uncaught
+  // when nothing caught it (WATCH_MODE's outer per-block catch papered
+  // over it, at the cost of silently losing every other candidate that
+  // pass would have checked). Caught explicitly now: this is a normal,
+  // expected outcome to record and move on from, not a fatal error --
+  // especially load-bearing for DRY_RUN mode, whose entire point is
+  // running unattended for a long stretch without dying on the first
+  // near-miss.
   let effectiveMinProfit = minProfit;
+  let gasEstimate;
+  try {
+    gasEstimate = await botSubmit.requestFlashLoanArbitrage.estimateGas(
+      amount,
+      adapter1,
+      routeData1,
+      adapter2,
+      routeData2,
+      minProfit,
+      slippageBps,
+      deadlineSeconds,
+      executeBefore
+    );
+  } catch (err) {
+    log.info(`gas estimate reverted (would fail on real execution): ${err.shortMessage || err.message}, skipping`);
+    db.recordAttempt({
+      network: NETWORK_LABEL,
+      adapter1,
+      adapter2,
+      amount: amount.toString(),
+      quotedNetProfit: netProfit.toString(),
+      outcome: 'skipped_would_revert',
+      errorMessage: err.shortMessage || err.message,
+    });
+    return;
+  }
+  const feeData = await submitProvider.getFeeData();
+  // Headroom: the on-chain gas backstop only measures executeOperation's
+  // own gas, not the outer tx's base cost, calldata cost, or Aave's
+  // pre/post bookkeeping -- this estimate has the same blind spots.
+  const gasCostWei = (gasEstimate * feeData.maxFeePerGas * GAS_HEADROOM_PCT) / 100n;
   if (isBorrowedAssetWeth) {
-    let gasEstimate;
-    try {
-      // estimateGas simulates the real call -- if the trade would
-      // actually revert on execution (most commonly InsufficientReturn(),
-      // a real quote-to-execution gap; see the contract's own doc
-      // comment on that error), this throws here, before anything is
-      // sent. That's the whole safety mechanism working as intended --
-      // but previously nothing caught it, so it crashed the entire
-      // process uncaught in one-shot mode (WATCH_MODE's outer per-block
-      // catch papered over it, at the cost of silently losing every
-      // other candidate that pass would have checked). Caught explicitly
-      // now: this is a normal, expected outcome to record and move on
-      // from, not a fatal error -- especially load-bearing for DRY_RUN
-      // mode, whose entire point is running unattended for a long
-      // stretch without dying on the first near-miss.
-      gasEstimate = await botSubmit.requestFlashLoanArbitrage.estimateGas(
-        amount,
-        adapter1,
-        routeData1,
-        adapter2,
-        routeData2,
-        minProfit,
-        slippageBps,
-        deadlineSeconds,
-        executeBefore
-      );
-    } catch (err) {
-      log.info(`gas estimate reverted (would fail on real execution): ${err.shortMessage || err.message}, skipping`);
-      db.recordAttempt({
-        network: NETWORK_LABEL,
-        adapter1,
-        adapter2,
-        amount: amount.toString(),
-        quotedNetProfit: netProfit.toString(),
-        outcome: 'skipped_would_revert',
-        errorMessage: err.shortMessage || err.message,
-      });
-      return;
-    }
-    const feeData = await submitProvider.getFeeData();
-    // Headroom: the on-chain gas backstop only measures executeOperation's
-    // own gas, not the outer tx's base cost, calldata cost, or Aave's
-    // pre/post bookkeeping -- this estimate has the same blind spots.
-    const gasCostWei = (gasEstimate * feeData.maxFeePerGas * GAS_HEADROOM_PCT) / 100n;
     effectiveMinProfit = minProfit + gasCostWei;
+  } else if (gasConversion) {
+    const gasCostInBorrowedAsset = await convertGasCostToBorrowedAsset(gasCostWei, gasConversion);
+    if (gasCostInBorrowedAsset !== null) {
+      effectiveMinProfit = minProfit + gasCostInBorrowedAsset;
+    } else {
+      log.info('no live WETH pool price available to convert gas cost into borrowed-asset units this block -- falling back to minProfit alone (unadjusted for gas) for this attempt');
+    }
   }
 
   if (netProfit < effectiveMinProfit) {
@@ -751,6 +764,25 @@ async function resolveHopPrice(protocol, tokenIn, tokenOut, fee, factoryAddress)
 }
 
 /**
+ * Converts a gas cost (ETH/wei) into borrowed-asset units via a live
+ * WETH->borrowedAsset v3 price, for networks where BORROWED_ASSET isn't
+ * WETH itself (so gasCostWei isn't directly comparable to netProfit --
+ * see tryRoute()'s own comment on this). Tries each configured fee tier
+ * in turn, using whichever one actually has a live pool; returns null if
+ * none do, in which case the caller falls back to minProfit alone, same
+ * safe behavior as before this existed.
+ */
+async function convertGasCostToBorrowedAsset(gasCostWei, { wethAddress, borrowedAsset, feeTiers, v3FactoryAddress }) {
+  for (const fee of feeTiers) {
+    const price = await resolveHopPrice('v3', wethAddress, borrowedAsset, fee, v3FactoryAddress);
+    if (price) {
+      return applyHopPrice({ tokenIn: wethAddress, tokenOut: borrowedAsset, fee }, price, gasCostWei);
+    }
+  }
+  return null;
+}
+
+/**
  * Cheap local ranking + sizing pass before the expensive, authoritative
  * quoteRoute() check: fetches ONE price per unique hop across the whole
  * candidate set (not one per candidate -- the same via-token/fee hop
@@ -937,15 +969,33 @@ async function loadScanConfig() {
 
   const [decimals, wethAddress] = await Promise.all([resolveDecimals(borrowedAsset), bot.WETH()]);
   const amount = ethers.parseUnits(process.env.SCAN_AMOUNT || '1', decimals);
+  const isBorrowedAssetWeth = borrowedAsset.toLowerCase() === wethAddress.toLowerCase();
+  const feeTiers = parseFeeTiers(process.env.FEE_TIERS);
+  const v3FactoryAddress = process.env.V3_FACTORY_ADDRESS || null;
+
+  // When BORROWED_ASSET isn't WETH, gasCostWei (ETH) isn't directly
+  // comparable to netProfit (borrowed-asset units) -- see tryRoute()'s
+  // own comment on this. If WETH is reachable as a via-token and a v3
+  // factory is configured, a live WETH->borrowedAsset price lets
+  // tryRoute() convert gas cost into borrowed-asset units instead of
+  // skipping the gas adjustment entirely (which would let any
+  // netProfit >= minProfit trivially "clear" the threshold with zero
+  // gas accounted for -- caught live on Ethereum Mainnet the moment
+  // BORROWED_ASSET switched to USDC for the Curve cross-DEX work).
+  const gasConversion =
+    !isBorrowedAssetWeth && v3FactoryAddress && viaTokens.some((t) => t.toLowerCase() === wethAddress.toLowerCase())
+      ? { wethAddress, borrowedAsset, feeTiers, v3FactoryAddress }
+      : null;
 
   return {
     genericAdapters,
     curveAdapters,
     borrowedAsset,
-    isBorrowedAssetWeth: borrowedAsset.toLowerCase() === wethAddress.toLowerCase(),
+    isBorrowedAssetWeth,
+    gasConversion,
     decimals,
     viaTokens,
-    feeTiers: parseFeeTiers(process.env.FEE_TIERS),
+    feeTiers,
     amount,
     minProfit: ethers.parseUnits(process.env.MIN_PROFIT || '0.01', decimals),
     slippageBps: Number(process.env.SLIPPAGE_BPS || 300),
@@ -954,7 +1004,7 @@ async function loadScanConfig() {
     // both optional. Leaving them unset disables the pre-filter entirely,
     // so every candidate still reaches the real quoteRoute() check exactly
     // as before this feature existed.
-    v3FactoryAddress: process.env.V3_FACTORY_ADDRESS || null,
+    v3FactoryAddress,
     v2FactoryAddress: process.env.V2_FACTORY_ADDRESS || null,
     prefilterTopN: Number(process.env.PREFILTER_TOP_N || 25),
     // Trade sizer (see sizeTradesUsingCache() above) -- only takes effect
@@ -989,7 +1039,7 @@ async function scanOnce(config) {
   // tryRoute() re-quotes internally before submitting -- intentional, not
   // duplicate work: it's a fresh state check immediately before spending
   // gas, in case anything moved between this scan and now.
-  await tryRoute(best, config.decimals, config.isBorrowedAssetWeth);
+  await tryRoute(best, config.decimals, config.isBorrowedAssetWeth, config.gasConversion);
 }
 
 async function main() {
