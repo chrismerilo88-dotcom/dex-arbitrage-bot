@@ -294,6 +294,23 @@ Adapter and WBNB/USDT approved, `approvalDelay` 0, `maxLoanAmount` confirmed 0 p
 
 Off-chain scanner runs persistently via systemd (`off-chain-bot/dex-arbitrage-scanner-bnb-mainnet.service`, same pattern as the other two mainnet scanners), `WATCH_MODE=true`, `DRY_RUN=true`. `node shared/report.js` (filter by "BNB Chain Mainnet") tracks progress here too.
 
+### Second DEX added (2026-08-14): BiSwap
+
+After ~4,634 attempts on PancakeSwap V3 alone with zero profitable opportunities, added a second DEX -- same reasoning as Arbitrum's SushiSwap addition. **BiSwap chosen deliberately over PancakeSwap V2 or ApeSwap**: PancakeSwap V2 is the same team as the already-deployed V3 pool, so their own market-makers likely keep V2/V3 prices aligned (same dead-end pattern as Ethereum's fee-tier scanning finding nothing). BiSwap is an independent team, more likely to show genuine divergence.
+
+**Address conflict caught, verified live before trusting either**: a web search returned two different "official" BiSwap router addresses -- one from a search snippet (`0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8`), one from BiSwap's own official docs page, labeled "Smart Router" (`0x0eB6949e725A295Ecb3BEacFc3766610BC970BEF`). Verified via direct `cast call` against both:
+- `0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8`: `factory()` returns `0x858E3312ed3A876947EA49d572A7C42DE08af7EE`, `WETH()` returns `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c` -- the exact same WBNB address already verified elsewhere in this file (self-consistent ground truth). This is the real classic-`IUniswapV2Router02`-interface router.
+- `0x0eB6949e725A295Ecb3BEacFc3766610BC970BEF` ("Smart Router" per BiSwap's own docs): both `factory()` and `WETH()` **revert** -- not a standard V2 router interface at all, incompatible with `UniswapV2Adapter.sol`. Official docs pointed at the wrong contract for this purpose.
+
+| Contract | Address | Verified via |
+|---|---|---|
+| BiSwap Router | `0x3a6d8cA21D1CF76F653A67577FA0D27453350dD8` | `cast code` + `factory()`/`WETH()` self-consistency check above |
+| BiSwap Factory | `0x858E3312ed3A876947EA49d572A7C42DE08af7EE` | Discovered live via the router's own `factory()` -- not from any external source |
+| WBNB/USDT pair | `0x8840C6252e2e86e545deFb6da98B2a0E26d8C1BA` | `Factory.getPair()` + `getReserves()`: ~207,751 USDT / ~339 WBNB (~$612/BNB, ~$415k+ TVL) -- real, substantial liquidity |
+| `BiSwapAdapter` (a `UniswapV2Adapter` instance) | `0x5C6CC639AC1d094c3A2d6ef9ae8926856e2fA2e0` | Deployed via the established `cast send --create` workaround. `ROUTER()` confirmed live matching the router above. End-to-end `quote()` tested: 1 WBNB -> 608.99 USDT, consistent with the pool's real reserves |
+
+Approved (`isAdapterApproved()` confirmed `true` immediately, `approvalDelay` still 0 on this network). `off-chain-bot/.env.bnb-mainnet`'s `ADAPTERS` now lists both adapters (`v3,v2`) and `V2_FACTORY_ADDRESS` was added so the reserve-math pre-filter covers the new adapter too. Scanner restarted and confirmed live: candidate count went from 16 (V3-only) to 25 (V2×V3 cross-DEX combinations), all 25 returning real quotes. `maxLoanAmount` reconfirmed `0` before and after every step of this addition -- still DRY_RUN only, no ability to execute a real trade.
+
 ## 🔄 Curve / Balancer — investigated, blocked, not verified
 
 The off-chain bot already has working infrastructure for both protocols (protocol-tagged `ADAPTERS` config, correct route encoding for each, and for Curve specifically, on-chain auto-discovery of a pool's traded pair via `coins()` -- see `off-chain-bot/index.js`). Neither has an actual verified pool to point that infrastructure at yet.
