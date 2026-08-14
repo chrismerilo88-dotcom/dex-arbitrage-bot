@@ -207,4 +207,71 @@ contract DexArbitrageBotFlashLoanFuzzTest is Test {
             assertGe(expectedProfit, minProfit, "invariant violated: profit below minProfit yet the call succeeded");
         }
     }
+
+    /// @notice Companion to the test above, covering the one profit-floor
+    /// path that one deliberately left untested: the WETH-specific gas
+    /// backstop (ProfitBelowGasCost, item 21 in the contract's header).
+    /// gasCostWei depends on real, measured gas usage inside
+    /// executeOperation() (gasStart - gasleft()) times tx.gasprice, which
+    /// this test can't predict exactly from the outside without
+    /// duplicating the EVM's own gas accounting -- so rather than fuzz
+    /// the exact revert/success boundary (fragile, and not the
+    /// interesting property anyway), this fuzzes tx.gasprice across a
+    /// wide range and checks the two ends that ARE robust to unknown
+    /// exact gas usage: a dust-sized (1 wei) profit can never slip past
+    /// the backstop, and a clearly-enormous profit is never blocked by
+    /// it.
+    function testFuzz_ExecuteOperation_WethGasBackstop(uint256 amount, uint16 premiumBps, uint256 leg1Out, uint256 gasPriceWei, bool profitable) public {
+        amount = bound(amount, 1e6, 1e24);
+        premiumBps = uint16(bound(premiumBps, 0, 1000));
+        leg1Out = bound(leg1Out, 1, 1e24);
+        gasPriceWei = bound(gasPriceWei, 1, 500 gwei);
+        vm.txGasPrice(gasPriceWei);
+
+        MockERC20 borrowedAsset = new MockERC20();
+        MockERC20 midToken = new MockERC20();
+        MockFlashLoanPool pool = new MockFlashLoanPool(premiumBps);
+        MockPoolAddressesProvider addressesProvider = new MockPoolAddressesProvider(address(pool));
+        // borrowedAsset IS WETH here (unlike the test above) -- the whole
+        // point is exercising the asset == WETH branch.
+        DexArbitrageBotFlashLoan bot = new DexArbitrageBotFlashLoan(address(addressesProvider), address(borrowedAsset));
+
+        uint256 premium = (amount * premiumBps) / 10000;
+        uint256 amountOwed = amount + premium;
+        // +1 wei (dust, virtually certain to lose to any real gas cost) or
+        // +1e24 (enormous, virtually certain to clear any real gas cost)
+        // -- see the doc comment above for why the exact boundary itself
+        // isn't fuzzed.
+        uint256 leg2Out = profitable ? amountOwed + 1e24 : amountOwed + 1;
+
+        MockDexAdapter adapter1 = new MockDexAdapter(leg1Out);
+        MockDexAdapter adapter2 = new MockDexAdapter(leg2Out);
+
+        bot.setApprovalDelay(0);
+        bot.approveAdapter(address(adapter1), true);
+        bot.approveAdapter(address(adapter2), true);
+        bot.approveToken(address(borrowedAsset), true);
+        bot.approveToken(address(midToken), true);
+        bot.setMaxLoanAmount(amount);
+
+        bytes memory routeData1 = RouteData.encode(RouteTestHelpers.pair(address(borrowedAsset), address(midToken)), "");
+        bytes memory routeData2 = RouteData.encode(RouteTestHelpers.pair(address(midToken), address(borrowedAsset)), "");
+        uint256 ownerBalanceBefore = borrowedAsset.balanceOf(address(this));
+
+        if (profitable) {
+            bot.requestFlashLoanArbitrage(
+                amount, address(adapter1), routeData1, address(adapter2), routeData2, 0, 0, 3600, block.timestamp + 1 hours
+            );
+            assertEq(
+                borrowedAsset.balanceOf(address(this)) - ownerBalanceBefore,
+                leg2Out - amountOwed,
+                "enormous-profit WETH trade was blocked or paid out the wrong amount"
+            );
+        } else {
+            vm.expectRevert(ProfitBelowGasCost.selector);
+            bot.requestFlashLoanArbitrage(
+                amount, address(adapter1), routeData1, address(adapter2), routeData2, 0, 0, 3600, block.timestamp + 1 hours
+            );
+        }
+    }
 }
