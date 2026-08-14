@@ -48,6 +48,7 @@ const {
   parseFeeTiers,
   buildTwoLegCandidates,
   buildTriangularCandidates,
+  buildCurveCrossCandidates,
   hopKey,
   applyHopChain,
   findOptimalTradeSize,
@@ -658,13 +659,15 @@ async function cancelStuckTransaction(nonce) {
  * pool actually trades (coins(0)/coins(1)) -- there's no "try every via
  * token" search for Curve the way there is for v2/v3, since one adapter
  * instance is bound to one already-deployed pool with a fixed pair. If
- * that pair is {BORROWED_ASSET, someOtherToken}, generates the one
- * round-trip candidate this adapter can actually serve, in both coin-
- * index directions. If it doesn't include BORROWED_ASSET at all, this
- * adapter contributes nothing to this scan (not an error -- just not a
- * relevant pool for the asset currently being borrowed).
+ * that pair is {BORROWED_ASSET, someOtherToken}, pairs that Curve leg
+ * against every configured generic (v2/v3) adapter instead of round-
+ * tripping through the same Curve pool (which can never be profitable
+ * -- see buildCurveCrossCandidates() in lib.js). If it doesn't include
+ * BORROWED_ASSET at all, this adapter contributes nothing to this scan
+ * (not an error -- just not a relevant pool for the asset currently
+ * being borrowed).
  */
-async function resolveCurveCandidates(curveAdapters, borrowedAsset, provider, { amount, minProfit, slippageBps }) {
+async function resolveCurveCrossCandidates(curveAdapters, genericAdapters, borrowedAsset, provider, { amount, minProfit, slippageBps, feeTiers }) {
   const candidates = [];
   for (const { address } of curveAdapters) {
     const curveAdapterContract = new ethers.Contract(address, ['function POOL() view returns (address)'], provider);
@@ -673,25 +676,30 @@ async function resolveCurveCandidates(curveAdapters, borrowedAsset, provider, { 
     const [coin0, coin1] = await Promise.all([pool.coins(0), pool.coins(1)]);
 
     const borrowedLower = borrowedAsset.toLowerCase();
-    let otherToken, iOut, jOut;
+    let otherToken, curveIOut, curveJOut;
     if (coin0.toLowerCase() === borrowedLower) {
-      [otherToken, iOut, jOut] = [coin1, 0, 1];
+      [otherToken, curveIOut, curveJOut] = [coin1, 0, 1];
     } else if (coin1.toLowerCase() === borrowedLower) {
-      [otherToken, iOut, jOut] = [coin0, 1, 0];
+      [otherToken, curveIOut, curveJOut] = [coin0, 1, 0];
     } else {
       log.info(`curve adapter ${address}: pool trades ${coin0}/${coin1}, doesn't include BORROWED_ASSET -- skipping`);
       continue;
     }
 
-    candidates.push({
-      amount,
-      adapter1: address,
-      routeData1: encodeCurveRouteData([borrowedAsset, otherToken], iOut, jOut),
-      adapter2: address,
-      routeData2: encodeCurveRouteData([otherToken, borrowedAsset], jOut, iOut),
-      minProfit,
-      slippageBps,
-    });
+    candidates.push(
+      ...buildCurveCrossCandidates({
+        curveAdapterAddress: address,
+        genericAdapters,
+        borrowedAsset,
+        otherToken,
+        curveIOut,
+        curveJOut,
+        feeTiers,
+        amount,
+        minProfit,
+        slippageBps,
+      })
+    );
   }
   return candidates;
 }
@@ -868,7 +876,7 @@ async function buildCandidates(config) {
   // via-token space the way the generic builders do), so they were never
   // the source of combinatorial RPC load this pre-filter exists to cut.
   if (config.curveAdapters.length > 0) {
-    candidates.push(...(await resolveCurveCandidates(config.curveAdapters, config.borrowedAsset, provider, config)));
+    candidates.push(...(await resolveCurveCrossCandidates(config.curveAdapters, config.genericAdapters, config.borrowedAsset, provider, config)));
   }
   return candidates;
 }
