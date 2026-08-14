@@ -176,6 +176,87 @@ describe('candidate building', () => {
   });
 });
 
+describe('buildCurveCrossCandidates', () => {
+  const curveConfig = {
+    curveAdapterAddress: ADAPTER_A,
+    genericAdapters: [{ address: ADAPTER_B, protocol: 'v3' }],
+    borrowedAsset: USDC,
+    otherToken: DAI,
+    curveIOut: 1,
+    curveJOut: 0,
+    feeTiers: [500, 3000],
+    amount: 100n,
+    minProfit: 0n,
+    slippageBps: 300,
+  };
+
+  test('produces two candidates per generic adapter per fee tier (both pairing directions)', () => {
+    const candidates = lib.buildCurveCrossCandidates(curveConfig);
+    // 1 generic adapter x 2 fee tiers x 2 directions = 4
+    assert.equal(candidates.length, 4);
+  });
+
+  test('curve-out direction: adapter1 is curve, adapter2 is the generic adapter', () => {
+    const candidates = lib.buildCurveCrossCandidates(curveConfig);
+    const curveOut = candidates.filter((c) => c.adapter1 === ADAPTER_A);
+    assert.equal(curveOut.length, 2); // one per fee tier
+    for (const c of curveOut) {
+      assert.equal(c.adapter2, ADAPTER_B);
+    }
+  });
+
+  test('generic-out direction: adapter1 is the generic adapter, adapter2 is curve', () => {
+    const candidates = lib.buildCurveCrossCandidates(curveConfig);
+    const genericOut = candidates.filter((c) => c.adapter1 === ADAPTER_B);
+    assert.equal(genericOut.length, 2);
+    for (const c of genericOut) {
+      assert.equal(c.adapter2, ADAPTER_A);
+    }
+  });
+
+  test('curve leg route data decodes to borrowedAsset/otherToken with the correct coin indices', () => {
+    const candidates = lib.buildCurveCrossCandidates(curveConfig);
+    const curveOut = candidates.find((c) => c.adapter1 === ADAPTER_A);
+    const [tokens, extra] = ethers.AbiCoder.defaultAbiCoder().decode(['address[]', 'bytes'], curveOut.routeData1);
+    assert.deepEqual([...tokens], [USDC, DAI]);
+    const [i, j] = ethers.AbiCoder.defaultAbiCoder().decode(['int128', 'int128'], extra);
+    assert.equal(i, 1n);
+    assert.equal(j, 0n);
+  });
+
+  test('the return leg of the curve-out direction is the curve leg reversed (otherToken -> borrowedAsset, indices swapped)', () => {
+    const candidates = lib.buildCurveCrossCandidates(curveConfig);
+    const curveOut = candidates.find((c) => c.adapter1 === ADAPTER_A);
+    const [tokens, extra] = ethers.AbiCoder.defaultAbiCoder().decode(['address[]', 'bytes'], candidates.find((c) => c.adapter2 === ADAPTER_A).routeData2);
+    assert.deepEqual([...tokens], [DAI, USDC]);
+    const [i, j] = ethers.AbiCoder.defaultAbiCoder().decode(['int128', 'int128'], extra);
+    assert.equal(i, 0n);
+    assert.equal(j, 1n);
+    void curveOut; // (referenced above only to locate the pair; assertion is on the found candidate)
+  });
+
+  test('collapses the fee-tier loop for a v2 generic adapter', () => {
+    const candidates = lib.buildCurveCrossCandidates({
+      ...curveConfig,
+      genericAdapters: [{ address: ADAPTER_B, protocol: 'v2' }],
+    });
+    // 1 generic adapter x 1 (no fee loop) x 2 directions = 2
+    assert.equal(candidates.length, 2);
+  });
+
+  test('multiple generic adapters each produce their own candidate pairs', () => {
+    const candidates = lib.buildCurveCrossCandidates({
+      ...curveConfig,
+      genericAdapters: [
+        { address: ADAPTER_B, protocol: 'v2' },
+        { address: '0xcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcCcC', protocol: 'v2' },
+      ],
+    });
+    // 2 generic adapters x 1 (v2, no fee loop) x 2 directions = 4
+    assert.equal(candidates.length, 4);
+  });
+});
+
 describe('hopKey', () => {
   test('is case-insensitive on addresses', () => {
     const a = { protocol: 'v3', tokenIn: WETH, tokenOut: USDC.toLowerCase(), fee: 3000 };

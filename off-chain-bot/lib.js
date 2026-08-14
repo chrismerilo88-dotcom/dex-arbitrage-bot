@@ -205,6 +205,73 @@ function buildTriangularCandidates({ genericAdapters, borrowedAsset, viaTokens, 
   return candidates;
 }
 
+/**
+ * Pairs a single Curve leg against every generic (v2/v3) adapter, in
+ * both directions -- the combination `resolveCurveCandidates` never
+ * produced (it only ever round-tripped through the same Curve pool,
+ * which can never be profitable). Given an already-resolved pairing
+ * (which token the pool trades against `borrowedAsset`, and that pool's
+ * own coin indices for each), builds:
+ *   - borrowed -> otherToken (Curve) -> borrowed (generic adapter)
+ *   - borrowed -> otherToken (generic adapter) -> borrowed (Curve)
+ * CurveAdapter.sol requires exactly 2 tokens per leg, so unlike
+ * buildTriangularCandidates, there's no multi-hop-in-one-leg variant
+ * here -- 2-leg only.
+ */
+function buildCurveCrossCandidates({
+  curveAdapterAddress,
+  genericAdapters,
+  borrowedAsset,
+  otherToken,
+  curveIOut,
+  curveJOut,
+  feeTiers,
+  amount,
+  minProfit,
+  slippageBps,
+}) {
+  const candidates = [];
+  const curveOutRouteData = encodeCurveRouteData([borrowedAsset, otherToken], curveIOut, curveJOut);
+  const curveBackRouteData = encodeCurveRouteData([otherToken, borrowedAsset], curveJOut, curveIOut);
+
+  for (const generic of genericAdapters) {
+    const fees = generic.protocol === 'v3' ? feeCombos(feeTiers, 1) : [[]];
+    for (const [fee] of fees) {
+      // Curve out, generic adapter back.
+      candidates.push({
+        amount,
+        adapter1: curveAdapterAddress,
+        routeData1: curveOutRouteData,
+        adapter2: generic.address,
+        routeData2: encodeForProtocol(generic.protocol, [otherToken, borrowedAsset], [fee]),
+        minProfit,
+        slippageBps,
+        _hops: [
+          { protocol: 'curve', tokenIn: borrowedAsset, tokenOut: otherToken, fee: undefined },
+          { protocol: generic.protocol, tokenIn: otherToken, tokenOut: borrowedAsset, fee },
+        ],
+      });
+
+      // Generic adapter out, Curve back.
+      candidates.push({
+        amount,
+        adapter1: generic.address,
+        routeData1: encodeForProtocol(generic.protocol, [borrowedAsset, otherToken], [fee]),
+        adapter2: curveAdapterAddress,
+        routeData2: curveBackRouteData,
+        minProfit,
+        slippageBps,
+        _hops: [
+          { protocol: generic.protocol, tokenIn: borrowedAsset, tokenOut: otherToken, fee },
+          { protocol: 'curve', tokenIn: otherToken, tokenOut: borrowedAsset, fee: undefined },
+        ],
+      });
+    }
+  }
+
+  return candidates;
+}
+
 function hopKey(hop) {
   return `${hop.protocol}:${hop.tokenIn.toLowerCase()}:${hop.tokenOut.toLowerCase()}:${hop.fee || 0}`;
 }
@@ -365,6 +432,7 @@ module.exports = {
   encodeForProtocol,
   buildTwoLegCandidates,
   buildTriangularCandidates,
+  buildCurveCrossCandidates,
   hopKey,
   Q96,
   v3SwapAmountOut,
