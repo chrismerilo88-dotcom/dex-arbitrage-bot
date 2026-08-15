@@ -44,6 +44,7 @@ const {
   GENERIC_PROTOCOLS,
   encodeCurveRouteData,
   parseAdapterList,
+  parseAdapterFactoryOverrides,
   parseAddressList,
   parseFeeTiers,
   buildTwoLegCandidates,
@@ -812,15 +813,22 @@ async function convertGasCostToBorrowedAsset(gasCostWei, { wethAddress, borrowed
  * candidates than the default PREFILTER_TOP_N.
  */
 async function prefilterCandidates(candidates, config) {
-  const { v3FactoryAddress, v2FactoryAddress, prefilterTopN, concurrency } = config;
-  if (!v3FactoryAddress && !v2FactoryAddress) {
+  const { v3FactoryAddress, v2FactoryAddress, adapterFactoryOverrides, prefilterTopN, concurrency } = config;
+  if (!v3FactoryAddress && !v2FactoryAddress && adapterFactoryOverrides.size === 0) {
     return candidates;
   }
 
   const uniqueHops = new Map();
   for (const c of candidates) {
     for (const hop of c._hops) {
-      const factoryAddress = hop.protocol === 'v3' ? v3FactoryAddress : hop.protocol === 'v2' ? v2FactoryAddress : null;
+      // adapterFactoryOverrides first: two adapters can share the same
+      // protocol tag (e.g. two 'v2' DEXes) while trading through
+      // different factories -- see ADAPTER_FACTORY_OVERRIDES in
+      // .env.example and hopKey()'s own doc comment in lib.js for why
+      // this matters, not just a preference.
+      const factoryAddress =
+        (hop.adapter && adapterFactoryOverrides.get(hop.adapter.toLowerCase())) ||
+        (hop.protocol === 'v3' ? v3FactoryAddress : hop.protocol === 'v2' ? v2FactoryAddress : null);
       if (!factoryAddress) continue;
       uniqueHops.set(hopKey(hop), { hop, factoryAddress });
     }
@@ -1006,6 +1014,13 @@ async function loadScanConfig() {
     // as before this feature existed.
     v3FactoryAddress,
     v2FactoryAddress: process.env.V2_FACTORY_ADDRESS || null,
+    // Per-adapter factory override, keyed by adapter address -- only
+    // needed when two adapters share a protocol tag but trade through
+    // different factories (see prefilterCandidates()'s use of this).
+    // Empty map (default) means every adapter of a given protocol uses
+    // that protocol's single global factory address above, same as
+    // before this existed.
+    adapterFactoryOverrides: parseAdapterFactoryOverrides(process.env.ADAPTER_FACTORY_OVERRIDES),
     prefilterTopN: Number(process.env.PREFILTER_TOP_N || 25),
     // Trade sizer (see sizeTradesUsingCache() above) -- only takes effect
     // when the pre-filter itself is enabled, since it reuses that same
