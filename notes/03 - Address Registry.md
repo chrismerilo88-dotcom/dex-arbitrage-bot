@@ -344,6 +344,23 @@ After ~4,634 attempts on PancakeSwap V3 alone with zero profitable opportunities
 
 Approved (`isAdapterApproved()` confirmed `true` immediately, `approvalDelay` still 0 on this network). `off-chain-bot/.env.bnb-mainnet`'s `ADAPTERS` now lists both adapters (`v3,v2`) and `V2_FACTORY_ADDRESS` was added so the reserve-math pre-filter covers the new adapter too. Scanner restarted and confirmed live: candidate count went from 16 (V3-only) to 25 (V2×V3 cross-DEX combinations), all 25 returning real quotes. `maxLoanAmount` reconfirmed `0` before and after every step of this addition -- still DRY_RUN only, no ability to execute a real trade.
 
+### Third DEX added (2026-08-15): ApeSwap, plus BUSD as a second via-token
+
+After ~11,700+ attempts across PancakeSwap V3 + BiSwap with zero opportunities, same escalation pattern as Arbitrum's Camelot addition. ApeSwap's real router (`0xcf0febd3f17cef5b47b0cd257acf6025c5bff3b7`, confirmed via `cast code` + self-consistent `WETH()` returning the exact same WBNB address already verified above) turned out to use the *classic* Uniswap V2 interface (`swapExactTokensForTokens`/`getAmountsOut` both confirmed present via `cast sig` against live bytecode) -- no custom adapter needed here, unlike Camelot.
+
+**Liquidity check changed the plan**: ApeSwap's WBNB/USDT pool (the pair every other adapter on this network already uses) was only ~2.99 WBNB / ~1,827 USDT (**~$3.6k TVL** -- over 100x thinner than BiSwap's equivalent pool) -- confirmed live before deploying anything, and correctly treated as not worth scanning rather than deployed anyway. Checked WBNB/BUSD instead: ~136.7 WBNB / ~83,461 BUSD (**~$167k TVL**, genuinely usable). Before committing to BUSD as a new via-token, checked whether it would only benefit ApeSwap or widen the whole cross-DEX surface -- both BiSwap (~$283k, 231.5 WBNB / 141,277 BUSD) and PancakeSwap V3 (real pool confirmed at the 2500 fee tier) also have real WBNB/BUSD liquidity, so this is a genuine surface expansion, not an isolated route.
+
+| Contract | Address | Verified via |
+|---|---|---|
+| ApeSwap Router | `0xcf0febd3f17cef5b47b0cd257acf6025c5bff3b7` | `cast code` + self-consistent `WETH()`/`factory()`; `factory()` independently matches the address BscScan itself labels "ApeSwap: ApeFactory" |
+| ApeSwap Factory | `0x0841BD0B734E4F5853f0dD8d7Ea041c241fb0Da6` | Discovered live via the router's own `factory()` |
+| WBNB/BUSD pair (ApeSwap) | `0x51e6D27FA57373d8d4C256231241053a70Cb1d93` | `Factory.getPair()` + `getReserves()` |
+| `ApeSwapAdapter` (a `UniswapV2Adapter` instance) | `0xa4fb04d1bc96573B7c906F1E7902042C8d7E529A` | Deployed via the established `cast send --create` workaround. `ROUTER()` confirmed live matching the router above |
+
+**Third real bug this project's DEX-expansion pattern has now surfaced twice** (see Arbitrum's Camelot addition above for the first): ApeSwap and BiSwap are both `'v2'`-tagged and, once BUSD was added, both trade the identical WBNB/BUSD pair -- exactly the `hopKey()` collision scenario fixed earlier tonight. `ADAPTER_FACTORY_OVERRIDES` (new, see Arbitrum section) set for ApeSwap's factory; BiSwap correctly keeps using the existing global `V2_FACTORY_ADDRESS`.
+
+Adapter and BUSD approved, `maxLoanAmount` reconfirmed `0`. Scanner restarted and verified live: raw candidate count jumped to 504 (three adapters x two via-tokens x triangular routes), correctly pre-filtered down to the top 25, all 25 returning real quotes -- confirms both the trimming and the adapter-aware `hopKey()` fix hold up at meaningfully larger scale, not just the smaller Arbitrum case that motivated the fix. `SCAN_CONCURRENCY` stays at 1 on this network (BNB's public RPC concurrency fragility, documented earlier in this section) -- confirmed no degradation in quote success rate at the new scale.
+
 ## 🔄 Balancer — investigated, blocked, not verified (Curve resolved -- see Ethereum Mainnet section above)
 
 The off-chain bot already has working infrastructure for both protocols (protocol-tagged `ADAPTERS` config, correct route encoding for each, and for Curve specifically, on-chain auto-discovery of a pool's traded pair via `coins()` -- see `off-chain-bot/index.js`). **Curve** no longer belongs in this "blocked" section -- see the Ethereum Mainnet section above for the real 3pool deployment and live DRY_RUN usage (2026-08-14). **Balancer** still has no actual verified pool to point its adapter at.
