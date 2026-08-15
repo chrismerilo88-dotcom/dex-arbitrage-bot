@@ -64,6 +64,25 @@ function parseAdapterList(raw) {
     });
 }
 
+/**
+ * Parses ADAPTER_FACTORY_OVERRIDES ("adapterAddress:factoryAddress,...")
+ * into a Map keyed by lowercased adapter address. Only needed when two
+ * adapters share the same protocol tag but trade through different
+ * factories (e.g. two separate 'v2' DEXes on the same network) -- the
+ * global V2_FACTORY_ADDRESS/V3_FACTORY_ADDRESS covers every other
+ * adapter of that protocol by default, this is strictly an override for
+ * the ones that need a different one. See prefilterCandidates()'s use of
+ * this in index.js.
+ */
+function parseAdapterFactoryOverrides(raw) {
+  const map = new Map();
+  for (const entry of (raw || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    const [adapter, factory] = entry.split(':').map((s) => s.trim());
+    map.set(adapter.toLowerCase(), factory);
+  }
+  return map;
+}
+
 function parseAddressList(raw) {
   return (raw || '')
     .split(',')
@@ -127,8 +146,8 @@ function buildTwoLegCandidates({ genericAdapters, borrowedAsset, viaTokens, feeT
             // not used by tryRoute()/rankCandidates(), which only ever
             // look at the already-encoded routeData.
             _hops: [
-              { protocol: adapter1.protocol, tokenIn: borrowedAsset, tokenOut: viaToken, fee: feeOut },
-              { protocol: adapter2.protocol, tokenIn: viaToken, tokenOut: borrowedAsset, fee: feeBack },
+              { protocol: adapter1.protocol, adapter: adapter1.address, tokenIn: borrowedAsset, tokenOut: viaToken, fee: feeOut },
+              { protocol: adapter2.protocol, adapter: adapter2.address, tokenIn: viaToken, tokenOut: borrowedAsset, fee: feeBack },
             ],
           });
         }
@@ -172,9 +191,9 @@ function buildTriangularCandidates({ genericAdapters, borrowedAsset, viaTokens, 
               minProfit,
               slippageBps,
               _hops: [
-                { protocol: adapter1.protocol, tokenIn: borrowedAsset, tokenOut: viaA, fee: feeOut },
-                { protocol: adapter2.protocol, tokenIn: viaA, tokenOut: viaB, fee: feeBackPair[0] },
-                { protocol: adapter2.protocol, tokenIn: viaB, tokenOut: borrowedAsset, fee: feeBackPair[1] },
+                { protocol: adapter1.protocol, adapter: adapter1.address, tokenIn: borrowedAsset, tokenOut: viaA, fee: feeOut },
+                { protocol: adapter2.protocol, adapter: adapter2.address, tokenIn: viaA, tokenOut: viaB, fee: feeBackPair[0] },
+                { protocol: adapter2.protocol, adapter: adapter2.address, tokenIn: viaB, tokenOut: borrowedAsset, fee: feeBackPair[1] },
               ],
             });
           }
@@ -192,9 +211,9 @@ function buildTriangularCandidates({ genericAdapters, borrowedAsset, viaTokens, 
               minProfit,
               slippageBps,
               _hops: [
-                { protocol: adapter1.protocol, tokenIn: borrowedAsset, tokenOut: viaA, fee: feeOutPair[0] },
-                { protocol: adapter1.protocol, tokenIn: viaA, tokenOut: viaB, fee: feeOutPair[1] },
-                { protocol: adapter2.protocol, tokenIn: viaB, tokenOut: borrowedAsset, fee: feeBack },
+                { protocol: adapter1.protocol, adapter: adapter1.address, tokenIn: borrowedAsset, tokenOut: viaA, fee: feeOutPair[0] },
+                { protocol: adapter1.protocol, adapter: adapter1.address, tokenIn: viaA, tokenOut: viaB, fee: feeOutPair[1] },
+                { protocol: adapter2.protocol, adapter: adapter2.address, tokenIn: viaB, tokenOut: borrowedAsset, fee: feeBack },
               ],
             });
           }
@@ -247,8 +266,8 @@ function buildCurveCrossCandidates({
         minProfit,
         slippageBps,
         _hops: [
-          { protocol: 'curve', tokenIn: borrowedAsset, tokenOut: otherToken, fee: undefined },
-          { protocol: generic.protocol, tokenIn: otherToken, tokenOut: borrowedAsset, fee },
+          { protocol: 'curve', adapter: curveAdapterAddress, tokenIn: borrowedAsset, tokenOut: otherToken, fee: undefined },
+          { protocol: generic.protocol, adapter: generic.address, tokenIn: otherToken, tokenOut: borrowedAsset, fee },
         ],
       });
 
@@ -262,8 +281,8 @@ function buildCurveCrossCandidates({
         minProfit,
         slippageBps,
         _hops: [
-          { protocol: generic.protocol, tokenIn: borrowedAsset, tokenOut: otherToken, fee },
-          { protocol: 'curve', tokenIn: otherToken, tokenOut: borrowedAsset, fee: undefined },
+          { protocol: generic.protocol, adapter: generic.address, tokenIn: borrowedAsset, tokenOut: otherToken, fee },
+          { protocol: 'curve', adapter: curveAdapterAddress, tokenIn: otherToken, tokenOut: borrowedAsset, fee: undefined },
         ],
       });
     }
@@ -272,8 +291,23 @@ function buildCurveCrossCandidates({
   return candidates;
 }
 
+/**
+ * Includes hop.adapter (the specific adapter address that executes this
+ * hop), not just its protocol tag -- two different DEXes can share the
+ * same protocol tag (e.g. two separate Uniswap-V2-style forks both
+ * tagged 'v2') while trading through entirely different pools for the
+ * identical token pair. Keying on protocol+tokens alone would silently
+ * collapse both into one cache entry, applying one DEX's real price to
+ * the other's candidates -- caught before it ever shipped, adding
+ * Camelot alongside SushiSwap as a second 'v2' adapter on Arbitrum's
+ * WETH/USDC pair. hop.adapter is optional (defaults to '') so any
+ * hop-shaped object that predates this field still produces a valid,
+ * internally-consistent key -- nothing needs it added retroactively as
+ * long as hopKey() itself is always used to both write and read a given
+ * cache entry, which every caller in this file already does.
+ */
 function hopKey(hop) {
-  return `${hop.protocol}:${hop.tokenIn.toLowerCase()}:${hop.tokenOut.toLowerCase()}:${hop.fee || 0}`;
+  return `${hop.protocol}:${(hop.adapter || '').toLowerCase()}:${hop.tokenIn.toLowerCase()}:${hop.tokenOut.toLowerCase()}:${hop.fee || 0}`;
 }
 
 const Q96 = 2n ** 96n;
@@ -425,6 +459,7 @@ module.exports = {
   encodeCurveRouteData,
   encodeBalancerRouteData,
   parseAdapterList,
+  parseAdapterFactoryOverrides,
   parseAddressList,
   parseFeeTiers,
   feeCombos,

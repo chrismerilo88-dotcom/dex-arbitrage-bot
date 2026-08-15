@@ -80,6 +80,19 @@ describe('config parsing', () => {
     assert.deepEqual(lib.parseAdapterList(undefined), []);
   });
 
+  test('parseAdapterFactoryOverrides maps a lowercased adapter address to its factory', () => {
+    const map = lib.parseAdapterFactoryOverrides(`${ADAPTER_A}:${WETH}`);
+    assert.equal(map.get(ADAPTER_A.toLowerCase()), WETH);
+  });
+
+  test('parseAdapterFactoryOverrides handles multiple entries and blank/unset input', () => {
+    const map = lib.parseAdapterFactoryOverrides(`${ADAPTER_A}:${WETH}, ${ADAPTER_B}:${USDC}`);
+    assert.equal(map.get(ADAPTER_A.toLowerCase()), WETH);
+    assert.equal(map.get(ADAPTER_B.toLowerCase()), USDC);
+    assert.equal(lib.parseAdapterFactoryOverrides('').size, 0);
+    assert.equal(lib.parseAdapterFactoryOverrides(undefined).size, 0);
+  });
+
   test('parseAddressList trims and filters blanks', () => {
     assert.deepEqual(lib.parseAddressList(` ${WETH} , ${USDC},`), [WETH, USDC]);
   });
@@ -140,11 +153,30 @@ describe('candidate building', () => {
       assert.equal(c.adapter1, ADAPTER_A);
       assert.equal(c.adapter2, ADAPTER_A);
       assert.equal(c._hops.length, 2);
+      assert.equal(c._hops[0].adapter, ADAPTER_A);
       assert.equal(c._hops[0].tokenIn, WETH);
       assert.equal(c._hops[0].tokenOut, USDC);
+      assert.equal(c._hops[1].adapter, ADAPTER_A);
       assert.equal(c._hops[1].tokenIn, USDC);
       assert.equal(c._hops[1].tokenOut, WETH);
     }
+  });
+
+  test('buildTwoLegCandidates tags each hop with the specific adapter that executes it -- two different DEXes on the same pair stay distinguishable', () => {
+    // The real Arbitrum scenario this guards against: SushiSwap and
+    // Camelot are both 'v2' but are genuinely different pools -- each
+    // candidate's hops must carry the adapter that actually produced
+    // that leg, not just its protocol tag (see hopKey()'s own tests).
+    const candidates = lib.buildTwoLegCandidates({
+      ...baseConfig,
+      genericAdapters: [
+        { address: ADAPTER_A, protocol: 'v2' },
+        { address: ADAPTER_B, protocol: 'v2' },
+      ],
+    });
+    const crossPair = candidates.find((c) => c.adapter1 === ADAPTER_A && c.adapter2 === ADAPTER_B);
+    assert.equal(crossPair._hops[0].adapter, ADAPTER_A);
+    assert.equal(crossPair._hops[1].adapter, ADAPTER_B);
   });
 
   test('buildTwoLegCandidates collapses the fee-tier loop for a v2 leg', () => {
@@ -268,6 +300,27 @@ describe('hopKey', () => {
     const forward = { protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 3000 };
     const reverse = { protocol: 'v3', tokenIn: USDC, tokenOut: WETH, fee: 3000 };
     assert.notEqual(lib.hopKey(forward), lib.hopKey(reverse));
+  });
+
+  test('differs by adapter -- two different DEXes tagged the same protocol, trading the identical pair, must not collide', () => {
+    // Real scenario this guards against: SushiSwap and Camelot are both
+    // tagged 'v2' on Arbitrum and both trade WETH/USDC -- without this,
+    // one DEX's cached price would silently get applied to the other's
+    // candidates.
+    const sushiswap = { protocol: 'v2', adapter: ADAPTER_A, tokenIn: WETH, tokenOut: USDC, fee: 0 };
+    const camelot = { protocol: 'v2', adapter: ADAPTER_B, tokenIn: WETH, tokenOut: USDC, fee: 0 };
+    assert.notEqual(lib.hopKey(sushiswap), lib.hopKey(camelot));
+  });
+
+  test('is case-insensitive on the adapter address too', () => {
+    const a = { protocol: 'v2', adapter: ADAPTER_A, tokenIn: WETH, tokenOut: USDC, fee: 0 };
+    const b = { protocol: 'v2', adapter: ADAPTER_A.toLowerCase(), tokenIn: WETH, tokenOut: USDC, fee: 0 };
+    assert.equal(lib.hopKey(a), lib.hopKey(b));
+  });
+
+  test('a hop with no adapter field still produces a valid, self-consistent key (backward compatible)', () => {
+    const withoutAdapter = { protocol: 'v3', tokenIn: WETH, tokenOut: USDC, fee: 3000 };
+    assert.equal(lib.hopKey(withoutAdapter), lib.hopKey({ ...withoutAdapter }));
   });
 });
 
